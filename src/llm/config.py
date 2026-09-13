@@ -16,6 +16,15 @@ def _get_default_model() -> str:
     return "gpt-4o"
 
 
+def _get_default_rerank() -> str:
+    r = os.getenv("ENABLE_RERANK", "auto").strip().lower()
+    if r in ("true", "1", "yes", "on"):
+        return "true"
+    if r in ("false", "0", "no", "off"):
+        return "false"
+    return "auto"
+
+
 class LLMConfig(BaseModel):
     api_key: str = Field(default_factory=lambda: os.getenv("LLM_API_KEY", ""))
     base_url: str | None = Field(
@@ -26,3 +35,4 @@ class LLMConfig(BaseModel):
         default_factory=lambda: float(os.getenv("LLM_TEMPERATURE", "0.7"))
     )
     tavily_api_key: str = Field(default_factory=lambda: os.getenv("TAVILY_API_KEY", ""))
+    enable_rerank: str = Field(default_factory=_get_default_rerank)

@@ -74,3 +74,15 @@ def test_document_reader_pdf(tmp_path):
     assert chunks[0]["page"] == "1"
     assert "GPU memory" in chunks[1]["text"]
     assert chunks[1]["page"] == "2"
+
+
+@pytest.mark.asyncio
+async def test_document_reader_read_source_local(tmp_path):
+    txt_path = tmp_path / "note.md"
+    txt_path.write_text("# 核心要点\n\n这是关于 FlashAttention 算子的深入技术解析。")
+
+    reader = DocumentReader(chunk_size=100)
+    chunks = await reader.read_source(str(txt_path))
+
+    assert len(chunks) >= 1
+    assert "FlashAttention" in chunks[0]["text"]

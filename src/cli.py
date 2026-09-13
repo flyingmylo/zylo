@@ -2,15 +2,14 @@ import asyncio
 import os
 import sys
 from typing import Annotated, Optional
-
 import typer
 from rich import box
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from src.llm.config import LLMConfig
 from src.llm.openai_provider import OpenAICompatibleProvider
+from src.llm.config import LLMConfig
 from src.orchestrator import WritingOrchestrator
 from src.state import WritingState
 
@@ -19,7 +18,6 @@ app = typer.Typer(
     name="zylo",
     help="🪶 [bold cyan]zylo[/bold cyan] - 基于纯手写多智能体架构的中文深度技术博客与长文写作系统",
     rich_markup_mode="rich",
-    no_args_is_help=True,
 )
 
 
@@ -33,7 +31,7 @@ def _mask_key(key: str) -> str:
 
 async def _run_write_async(
     topic: str,
-    files: list[str],
+    sources: list[str],
     instructions: str,
     model: str | None,
     base_url: str | None,
@@ -49,9 +47,7 @@ async def _run_write_async(
 
     if not effective_api_key:
         console.print("[bold red]❌ 错误：未检测到 LLM API Key！[/bold red]")
-        console.print(
-            "请通过环境变量 [cyan]LLM_API_KEY[/cyan] 或参数 [cyan]--api-key[/cyan] 指定。"
-        )
+        console.print("请通过环境变量 [cyan]LLM_API_KEY[/cyan] 或参数 [cyan]--api-key[/cyan] 指定。")
         raise typer.Exit(code=1)
 
     console.print(
@@ -59,7 +55,7 @@ async def _run_write_async(
             f"[bold cyan]🪶 zylo 写作任务启动[/bold cyan]\n"
             f"🎯 [yellow]技术主题[/yellow]: {topic}\n"
             f"🤖 [yellow]模型配置[/yellow]: {effective_model} (Base URL: {effective_base_url or 'OpenAI 官方'})\n"
-            f"📚 [yellow]参考资料[/yellow]: {files or '无本地文件（将执行网络检索）'}\n"
+            f"📚 [yellow]参考资料[/yellow]: {sources or '无本地/网页资料（将执行网络检索）'}\n"
             f"⚡ [yellow]重排精排[/yellow]: {'已开启 (BAAI/bge-reranker-v2-m3)' if rerank else '未开启 (默认相对 Top-K)'}\n"
             f"📁 [yellow]输出目录[/yellow]: {output_dir}",
             title="[bold green]任务配置面板[/bold green]",
@@ -73,7 +69,7 @@ async def _run_write_async(
         model=effective_model,
     )
 
-    # 懒加载本地模型，保持 CLI 启动极速
+    # 懒加载本地模型，放开原生进度条显示
     console.print(
         "[bold cyan]🔹 正在载入 BAAI/bge-m3 嵌入模型 (首次运行将通过镜像源自动下载权重)...[/bold cyan]"
     )
@@ -105,7 +101,7 @@ async def _run_write_async(
 
     state = await orchestrator.execute(
         topic=topic,
-        local_files=files,
+        local_files=sources,
         extra_instructions=instructions,
         output_dir=output_dir,
     )
@@ -127,40 +123,41 @@ async def _run_write_async(
 
 @app.command(
     name="write",
-    help="🚀 启动技术文章多 Agent 协同写作流程",
+    help="🚀 启动技术文章多 Agent 协同写作流程（支持位置参数直传或问答向导）",
 )
 def write(
-    topic: Annotated[
-        str,
-        typer.Option(
-            "-t",
-            "--topic",
-            help="文章核心技术主题（例如：'大模型 KV-Cache 显存优化技术演进'）",
-            prompt="请输入要写作的技术主题",
+    inputs: Annotated[
+        Optional[list[str]],
+        typer.Argument(
+            help="文章主题；后续参数可直接跟本地文件（.pdf/.md/.txt）或论文 URL（如 arXiv 链接）",
         ),
-    ],
+    ] = None,
+    topic: Annotated[
+        Optional[str],
+        typer.Option(
+            "-t", "--topic",
+            help="文章核心技术主题（亦可直接作为第一个位置参数传参）",
+        ),
+    ] = None,
     files: Annotated[
         Optional[list[str]],
         typer.Option(
-            "-f",
-            "--file",
-            help="本地参考文档/论文路径（支持 .pdf, .md, .txt，可多次指定）",
+            "-f", "--file",
+            help="参考文档路径或网页 URL，可多次指定（支持智能嗅探）",
         ),
     ] = None,
     instructions: Annotated[
         str,
         typer.Option(
-            "-i",
-            "--instructions",
+            "-i", "--instructions",
             help="给 Agent 的额外写作要求或目标读者定位",
         ),
     ] = "",
     model: Annotated[
         Optional[str],
         typer.Option(
-            "-m",
-            "--model",
-            help="LLM 模型名称（默认读取环境变量 LLM_MODEL 或 gpt-4o）",
+            "-m", "--model",
+            help="LLM 模型名称（默认读取环境变量 LLM_MODEL 或根据端点自动推导）",
         ),
     ] = None,
     base_url: Annotated[
@@ -178,30 +175,67 @@ def write(
         ),
     ] = None,
     rerank: Annotated[
-        bool,
+        Optional[bool],
         typer.Option(
             "--rerank/--no-rerank",
-            help="是否启用 BAAI/bge-reranker-v2-m3 本地深度精排",
+            help="是否启用 BAAI/bge-reranker-v2-m3 本地深度精排（默认: auto 智能条件激活）",
         ),
-    ] = False,
+    ] = None,
     output_dir: Annotated[
         str,
         typer.Option(
-            "-o",
-            "--output-dir",
+            "-o", "--output-dir",
             help="生成文章的输出保存目录",
         ),
     ] = "output",
 ):
+    all_sources = list(files or [])
+    final_topic = topic
+
+    # 1. 智能位置嗅探与合并 (Q3-A)
+    if inputs:
+        if not final_topic:
+            final_topic = inputs[0].strip()
+            remaining = inputs[1:]
+        else:
+            remaining = inputs
+
+        for item in remaining:
+            item_str = item.strip()
+            if item_str:
+                all_sources.append(item_str)
+
+    # 2. 交互式两步向导模式 (Q1-C & Q6-A)
+    if not final_topic:
+        console.print("\n[bold cyan]🪶 欢迎使用 zylo 智能写作向导[/bold cyan]\n")
+        final_topic = typer.prompt("📌 请输入文章主题").strip()
+        source_in = typer.prompt("📚 参考文件或论文链接 [直接回车跳过]", default="").strip()
+        if source_in:
+            all_sources.append(source_in)
+
+    # 3. 三态 Reranker 决策策略 (Q4-A + auto 智能激活)
+    config = LLMConfig()
+    if rerank is not None:
+        effective_rerank = rerank
+    else:
+        policy = config.enable_rerank.lower()
+        if policy in ("true", "1", "yes", "on"):
+            effective_rerank = True
+        elif policy in ("false", "0", "no", "off"):
+            effective_rerank = False
+        else:
+            # auto / default 模式：存在本地文档或论文链接时智能激活
+            effective_rerank = bool(all_sources)
+
     asyncio.run(
         _run_write_async(
-            topic=topic,
-            files=files or [],
+            topic=final_topic,
+            sources=all_sources,
             instructions=instructions,
             model=model,
             base_url=base_url,
             api_key=api_key,
-            rerank=rerank,
+            rerank=effective_rerank,
             output_dir=output_dir,
         )
     )
@@ -263,6 +297,16 @@ def check():
     base_url_desc = config.base_url or "https://api.openai.com/v1 (官方)"
     table.add_row("LLM Base URL", base_url_status, base_url_desc)
 
+    # Reranker 策略
+    policy_str = config.enable_rerank.lower()
+    if policy_str == "auto":
+        rerank_desc = "auto (有参考文件/URL资料时智能激活)"
+    elif policy_str in ("true", "1", "yes"):
+        rerank_desc = "true (常态保持开启)"
+    else:
+        rerank_desc = "false (默认关闭)"
+    table.add_row("重排 (Reranker)", "[green]✓ 已配置[/green]", rerank_desc)
+
     # Tavily 搜索
     tavily_status = (
         "[green]✓ 已配置[/green]"
@@ -291,7 +335,8 @@ def show_config():
             f"🔹 [bold]LLM_BASE_URL[/bold]: {config.base_url or '(默认 OpenAI 官方)'}\n"
             f"🔹 [bold]LLM_API_KEY[/bold]: {_mask_key(config.api_key)}\n"
             f"🔹 [bold]LLM_TEMPERATURE[/bold]: {config.temperature}\n"
-            f"🔹 [bold]TAVILY_API_KEY[/bold]: {_mask_key(config.tavily_api_key)}",
+            f"🔹 [bold]TAVILY_API_KEY[/bold]: {_mask_key(config.tavily_api_key)}\n"
+            f"🔹 [bold]ENABLE_RERANK[/bold]: {config.enable_rerank}",
             title="[bold cyan]zylo 当前有效配置[/bold cyan]",
             border_style="cyan",
         )
@@ -299,6 +344,17 @@ def show_config():
 
 
 def main():
+    # 智能快捷注入 (Q2-A)：若直接输入 zylo "主题" 或仅输入 zylo，自动映射为 write 命令
+    subcommands = {"check", "config", "write"}
+    raw_args = sys.argv[1:]
+    if raw_args:
+        first = raw_args[0]
+        if first not in ("--help", "-h", "--install-completion", "--show-completion") and first not in subcommands:
+            sys.argv.insert(1, "write")
+    else:
+        # 用户仅输入了 `zylo`，唤醒 write 交互式向导
+        sys.argv.insert(1, "write")
+
     app()
 
 

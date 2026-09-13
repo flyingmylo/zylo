@@ -27,23 +27,26 @@ cp .env.example .env
 
 ### 2. 运行 CLI 写作
 
-激活虚拟环境后，可直接使用 `zylo` 命令行工具：
+激活虚拟环境后，直接使用 `zylo` 命令行：
 
 ```bash
-# 诊断本机硬件加速 (MPS) 与 API Key 状态
+# 1. 极简一键写作（支持直接传参，第一个参数为主题，后续自动嗅探本地文件或 arXiv 论文直链）
+zylo "大模型 KV-Cache 显存优化技术演进"
+zylo "YOCO: 你只需缓存一次的大模型架构" references/yoco.pdf
+zylo "DeepSeek-V3 核心架构解析" https://arxiv.org/abs/2412.19437
+
+# 2. 交互式向导（直接敲 zylo 回车，两步极简提示输入）
+zylo
+
+# 3. 经典参数模式（可选高级控制）
+zylo write -t "FlashAttention 原理剖析" -f "references/fa.pdf" --rerank
+
+# 4. 系统环境诊断与配置查看
 zylo check
-
-# 查看当前生效配置
 zylo config
-
-# 基本写作：指定技术主题
-zylo write -t "大模型 KV-Cache 显存优化技术演进"
-
-# 进阶写作：挂载本地英文论文 PDF + 启用 Reranker 深度精排
-zylo write \
-  -t "FlashAttention 原理剖析与算子优化" \
-  -f "references/flashattention.pdf" \
-  --rerank
 ```
 
+> **💡 智能 Reranker 激活机制**：默认策略为 `ENABLE_RERANK=auto`。当检测到输入了本地文档或网页/论文 URL 时，系统会自动激活本地 `bge-reranker-v2-m3` 深度精排；纯纯网络检索时默认保持轻量极速。
+
 生成的 Markdown 文件将自动归档至 `output/` 目录。
+

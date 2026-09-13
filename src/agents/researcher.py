@@ -39,13 +39,13 @@ class ResearcherAgent(BaseAgent):
 
         all_chunks: list[dict[str, str]] = []
 
-        # 1. 解析本地参考文档
-        for file_path in state.local_files:
+        # 1. 解析参考文档（支持本地文件与在线论文/网页 URL）
+        for source in state.local_files:
             try:
-                chunks = self.doc_reader.read_file(file_path)
+                chunks = await self.doc_reader.read_source(source)
                 all_chunks.extend(chunks)
             except Exception as e:
-                state.errors.append(f"读取本地文件失败 {file_path}: {str(e)}")
+                state.errors.append(f"读取参考资料失败 {source}: {str(e)}")
 
         # 2. 联网补充搜索（针对主题生成中英文搜索词）
         if self.search_tool:

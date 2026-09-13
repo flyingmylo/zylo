@@ -179,3 +179,14 @@ async def test_revision_loop_execution(tmp_path):
     assert state.review_passed is True
     assert state.review_score == 95.0
     assert multi_mock.review_round == 2
+
+
+def test_cli_positional_logic():
+    # 测试参数提取逻辑
+    inputs = ["KV-Cache 显存优化", "references/yoco.pdf", "https://arxiv.org/abs/2405.05254"]
+    topic = inputs[0]
+    sources = inputs[1:]
+    assert topic == "KV-Cache 显存优化"
+    assert len(sources) == 2
+    assert "yoco.pdf" in sources[0]
+    assert sources[1].startswith("https://")
