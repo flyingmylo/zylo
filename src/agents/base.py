@@ -29,7 +29,7 @@ class BaseAgent(ABC):
     @abstractmethod
     async def run(self, state: WritingState) -> WritingState:
         """子类具体执行流程与状态更新"""
-        pass
+        ...
 
     def _get_tool_schemas(self) -> list[dict[str, Any]] | None:
         if not self.tools:

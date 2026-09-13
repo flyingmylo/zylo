@@ -1,4 +1,14 @@
+import os
+
 import torch
+
+# 自动配置国内 Hugging Face 高速镜像源与本地独立可写缓存目录
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+_default_cache = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", ".cache", "huggingface")
+)
+os.environ.setdefault("HF_HOME", _default_cache)
+
 from sentence_transformers import SentenceTransformer
 
 from .base import EmbeddingProvider

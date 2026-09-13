@@ -74,21 +74,23 @@ async def _run_write_async(
     )
 
     # 懒加载本地模型，保持 CLI 启动极速
-    with console.status(
-        "[bold green]正在加载本地 BAAI/bge-m3 嵌入模型 (M1 MPS 硬件加速)...[/bold green]"
-    ):
-        from src.embeddings.bge_provider import BGEM3EmbeddingProvider
+    console.print(
+        "[bold cyan]🔹 正在载入 BAAI/bge-m3 嵌入模型 (首次运行将通过镜像源自动下载权重)...[/bold cyan]"
+    )
+    from src.embeddings.bge_provider import BGEM3EmbeddingProvider
 
-        embedding_provider = BGEM3EmbeddingProvider()
+    embedding_provider = BGEM3EmbeddingProvider()
+    console.print("[bold green]✓ BAAI/bge-m3 嵌入模型已就绪 (MPS 加速)[/bold green]")
 
     reranker_provider = None
     if rerank:
-        with console.status(
-            "[bold green]正在加载本地 BAAI/bge-reranker-v2-m3 重排模型...[/bold green]"
-        ):
-            from src.embeddings.bge_reranker import BGERerankerProvider
+        console.print(
+            "[bold cyan]🔹 正在载入 BAAI/bge-reranker-v2-m3 重排模型 (首次运行将通过镜像源自动下载权重)...[/bold cyan]"
+        )
+        from src.embeddings.bge_reranker import BGERerankerProvider
 
-            reranker_provider = BGERerankerProvider()
+        reranker_provider = BGERerankerProvider()
+        console.print("[bold green]✓ BAAI/bge-reranker-v2-m3 重排模型已就绪 (MPS 加速)[/bold green]")
 
     def progress_logger(message: str, state: WritingState):
         console.print(f"[dim]{message}[/dim]")
@@ -248,12 +250,18 @@ def check():
     table.add_row("LLM API Key", llm_status, _mask_key(config.api_key))
 
     # LLM Model & Endpoint
-    table.add_row("LLM 模型", "[cyan]• 设定[/cyan]", config.model)
-    table.add_row(
-        "LLM Base URL",
-        "[cyan]• 设定[/cyan]",
-        config.base_url or "https://api.openai.com/v1 (官方)",
+    model_status = (
+        "[green]✓ 已配置[/green]"
+        if os.getenv("LLM_MODEL")
+        else "[cyan]• 默认[/cyan]"
     )
+    table.add_row("LLM 模型", model_status, config.model)
+
+    base_url_status = (
+        "[green]✓ 已配置[/green]" if config.base_url else "[cyan]• 默认[/cyan]"
+    )
+    base_url_desc = config.base_url or "https://api.openai.com/v1 (官方)"
+    table.add_row("LLM Base URL", base_url_status, base_url_desc)
 
     # Tavily 搜索
     tavily_status = (

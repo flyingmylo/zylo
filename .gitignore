@@ -40,6 +40,7 @@ htmlcov/
 .nox/
 
 # Vector Store / Local DB / Cache
+.cache/
 chroma_db/
 chroma_data/
 *.chroma

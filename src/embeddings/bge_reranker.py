@@ -1,4 +1,13 @@
+import os
+
 import torch
+
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+_default_cache = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", ".cache", "huggingface")
+)
+os.environ.setdefault("HF_HOME", _default_cache)
+
 from sentence_transformers import CrossEncoder
 
 from .reranker_base import RerankerProvider
