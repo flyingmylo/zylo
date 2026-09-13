@@ -86,3 +86,94 @@ async def test_document_reader_read_source_local(tmp_path):
 
     assert len(chunks) >= 1
     assert "FlashAttention" in chunks[0]["text"]
+
+
+def test_extract_arxiv_id():
+    # 测试各种格式的 arXiv 链接与输入变体
+    cases = [
+        ("https://arxiv.org/abs/2405.05254", "2405.05254"),
+        ("https://arxiv.org/abs/2405.05254v1", "2405.05254v1"),
+        ("https://arxiv.org/abs/2405.05254v2?context=cs", "2405.05254v2"),
+        ("https://arxiv.org/pdf/2405.05254.pdf", "2405.05254"),
+        ("https://arxiv.org/pdf/2405.05254", "2405.05254"),
+        ("https://export.arxiv.org/abs/2405.05254", "2405.05254"),
+        ("https://arxiv.org/html/2405.05254v1", "2405.05254v1"),
+        ("https://arxiv.org/abs/math.PR/0501001", "math.PR/0501001"),
+        ("https://arxiv.org/pdf/hep-th/9912012.pdf", "hep-th/9912012"),
+        ("arxiv:2405.05254", "2405.05254"),
+        ("2405.05254", "2405.05254"),
+        ("https://example.com/not_arxiv", None),
+        ("local_file.pdf", None),
+    ]
+
+    for raw, expected in cases:
+        assert DocumentReader.extract_arxiv_id(raw) == expected, f"Failed on: {raw}"
+
+
+@pytest.mark.asyncio
+async def test_read_source_arxiv_cache_hit(tmp_path):
+    cache_dir = tmp_path / "references"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = cache_dir / "arxiv_2405.05254.pdf"
+
+    # 预先在本地缓存中创建该论文
+    doc = pymupdf.open()
+    p = doc.new_page()
+    p.insert_text((50, 72), "YOCO: You Only Cache Once Architecture")
+    doc.save(str(pdf_path))
+    doc.close()
+
+    reader = DocumentReader(chunk_size=100, cache_dir=str(cache_dir))
+    # 传入 URL 时，应直接命中本地缓存文件，无需发起网络请求
+    chunks = await reader.read_source("https://arxiv.org/abs/2405.05254")
+
+    assert len(chunks) == 1
+    assert "YOCO" in chunks[0]["text"]
+    assert chunks[0]["source"] == "arxiv_2405.05254.pdf"
+
+
+@pytest.mark.asyncio
+async def test_read_source_arxiv_download_and_cache(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "references"
+    reader = DocumentReader(chunk_size=100, cache_dir=str(cache_dir))
+
+    # 构建模拟的 PDF 二进制内容
+    doc = pymupdf.open()
+    p = doc.new_page()
+    p.insert_text((50, 72), "Downloaded PDF content for DeepSeek-V3")
+    pdf_bytes = doc.tobytes()
+    doc.close()
+
+    class MockResponse:
+        status_code = 200
+        headers = {"content-type": "application/pdf"}
+        content = pdf_bytes
+
+    class MockAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, url, headers=None):
+            return MockResponse()
+
+    monkeypatch.setattr("httpx.AsyncClient", MockAsyncClient)
+
+    # 执行读取 (传入纯 ID)
+    chunks = await reader.read_source("2412.19437")
+
+    # 验证本地 references 目录下是否成功自动持久化生成文件
+    expected_cache_file = cache_dir / "arxiv_2412.19437.pdf"
+    assert expected_cache_file.exists()
+    assert expected_cache_file.stat().st_size > 0
+
+    # 验证解析的内容
+    assert len(chunks) == 1
+    assert "DeepSeek-V3" in chunks[0]["text"]
+    assert chunks[0]["source"] == "arxiv_2412.19437.pdf"
+
