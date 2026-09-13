@@ -1,0 +1,40 @@
+[project]
+name = "zylo"
+version = "0.1.0"
+description = "Zero-framework multi-agent technical blog writer with cross-lingual RAG"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.30.0",
+    "chromadb>=0.5.0",
+    "sentence-transformers>=3.0.0",
+    "torch>=2.2.0",
+    "tavily-python>=0.3.0",
+    "pymupdf>=1.24.0",
+    "httpx>=0.27.0",
+    "beautifulsoup4>=4.12.0",
+    "rich>=13.7.0",
+    "python-dotenv>=1.0.0",
+    "pydantic>=2.7.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "typer>=0.12.0"
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[project.scripts]
+zylo = "src.cli:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+filterwarnings = [
+    "ignore::DeprecationWarning:.*(SwigPy|swigvarlink).*",
+    "ignore::DeprecationWarning:importlib._bootstrap"
+]
