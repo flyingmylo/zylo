@@ -54,7 +54,7 @@ class WriterAgent(BaseAgent):
                 ]
                 if matching_revisions:
                     revision_note = (
-                        f"\n【上一轮审稿人对本节的修改意见，请务必针对性优化】:\n"
+                        "\n【上一轮审稿人对本节的修改意见，请务必针对性优化】:\n"
                         + "\n".join([f"- {r}" for r in matching_revisions])
                     )
 

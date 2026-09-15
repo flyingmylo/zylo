@@ -1,9 +1,11 @@
 import json
+
 import pytest
-from src.llm.base import LLMProvider, LLMResponse
+
 from src.embeddings.base import EmbeddingProvider
+from src.llm.base import LLMProvider, LLMResponse
 from src.orchestrator import WritingOrchestrator
-from src.state import WritingState, Stage
+from src.state import Stage
 
 
 class MockLLMProvider(LLMProvider):
@@ -15,11 +17,15 @@ class MockLLMProvider(LLMProvider):
 
         # Researcher keywords
         if "最核心的 2 个中文检索词" in system_msg:
-            return LLMResponse(content='["KV-Cache优化", "PageAttention", "KV-Cache memory", "vLLM"]')
+            return LLMResponse(
+                content='["KV-Cache优化", "PageAttention", "KV-Cache memory", "vLLM"]'
+            )
 
         # Researcher summary
         if "技术调研专家" in system_msg:
-            return LLMResponse(content="KV-Cache 是 LLM 推理加速的核心技术，但在长文本下带来显著显存压力。主要优化方案包含 PagedAttention 与量化。")
+            return LLMResponse(
+                content="KV-Cache 是 LLM 推理加速的核心技术，但在长文本下带来显著显存压力。主要优化方案包含 PagedAttention 与量化。"
+            )
 
         # Planner outline
         if "架构规划专家" in system_msg:
@@ -47,6 +53,7 @@ class MockLLMProvider(LLMProvider):
 
         # Writer
         if "技术作家" in system_msg:
+            assert user_msg, "Writer 的用户消息不应为空。"
             return LLMResponse(
                 content="### 正文小节\n\n在大模型推理阶段，键值缓存（KV-Cache）是核心技术。通过引入分页注意力（PagedAttention），系统可以大幅减少内存碎片。"
             )
@@ -79,7 +86,9 @@ async def test_full_pipeline_orchestration(tmp_path):
 
     # 准备一个临时英文参考文档
     ref_file = tmp_path / "paper_sample.md"
-    ref_file.write_text("PagedAttention allows storing continuous keys and values in non-contiguous memory spaces.")
+    ref_file.write_text(
+        "PagedAttention allows storing continuous keys and values in non-contiguous memory spaces."
+    )
 
     out_dir = tmp_path / "output"
 
@@ -138,21 +147,27 @@ class MultiRoundMockLLM(LLMProvider):
             self.review_round += 1
             if self.review_round == 1:
                 return LLMResponse(
-                    content=json.dumps({
-                        "passed": False,
-                        "score": 75.0,
-                        "critiques": ["第一节缺少具体的术语英文对照。"],
-                        "actionable_revisions": ["一、核心原理：请务必增加键值缓存（KV-Cache）双语对照。"],
-                    })
+                    content=json.dumps(
+                        {
+                            "passed": False,
+                            "score": 75.0,
+                            "critiques": ["第一节缺少具体的术语英文对照。"],
+                            "actionable_revisions": [
+                                "一、核心原理：请务必增加键值缓存（KV-Cache）双语对照。"
+                            ],
+                        }
+                    )
                 )
             else:
                 return LLMResponse(
-                    content=json.dumps({
-                        "passed": True,
-                        "score": 95.0,
-                        "critiques": ["修订版已完美补充双语对照。"],
-                        "actionable_revisions": [],
-                    })
+                    content=json.dumps(
+                        {
+                            "passed": True,
+                            "score": 95.0,
+                            "critiques": ["修订版已完美补充双语对照。"],
+                            "actionable_revisions": [],
+                        }
+                    )
                 )
 
         return LLMResponse(content="默认响应")
@@ -183,7 +198,11 @@ async def test_revision_loop_execution(tmp_path):
 
 def test_cli_positional_logic():
     # 测试参数提取逻辑
-    inputs = ["KV-Cache 显存优化", "references/yoco.pdf", "https://arxiv.org/abs/2405.05254"]
+    inputs = [
+        "KV-Cache 显存优化",
+        "references/yoco.pdf",
+        "https://arxiv.org/abs/2405.05254",
+    ]
     topic = inputs[0]
     sources = inputs[1:]
     assert topic == "KV-Cache 显存优化"

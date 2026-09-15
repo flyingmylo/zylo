@@ -2,14 +2,15 @@ import asyncio
 import os
 import sys
 from typing import Annotated, Optional
+
 import typer
 from rich import box
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from src.llm.openai_provider import OpenAICompatibleProvider
 from src.llm.config import LLMConfig
+from src.llm.openai_provider import OpenAICompatibleProvider
 from src.orchestrator import WritingOrchestrator
 from src.state import WritingState
 
@@ -47,7 +48,9 @@ async def _run_write_async(
 
     if not effective_api_key:
         console.print("[bold red]❌ 错误：未检测到 LLM API Key！[/bold red]")
-        console.print("请通过环境变量 [cyan]LLM_API_KEY[/cyan] 或参数 [cyan]--api-key[/cyan] 指定。")
+        console.print(
+            "请通过环境变量 [cyan]LLM_API_KEY[/cyan] 或参数 [cyan]--api-key[/cyan] 指定。"
+        )
         raise typer.Exit(code=1)
 
     console.print(
@@ -86,7 +89,9 @@ async def _run_write_async(
         from src.embeddings.bge_reranker import BGERerankerProvider
 
         reranker_provider = BGERerankerProvider()
-        console.print("[bold green]✓ BAAI/bge-reranker-v2-m3 重排模型已就绪 (MPS 加速)[/bold green]")
+        console.print(
+            "[bold green]✓ BAAI/bge-reranker-v2-m3 重排模型已就绪 (MPS 加速)[/bold green]"
+        )
 
     def progress_logger(message: str, state: WritingState):
         console.print(f"[dim]{message}[/dim]")
@@ -135,28 +140,32 @@ def write(
     topic: Annotated[
         Optional[str],
         typer.Option(
-            "-t", "--topic",
+            "-t",
+            "--topic",
             help="文章核心技术主题（亦可直接作为第一个位置参数传参）",
         ),
     ] = None,
     files: Annotated[
         Optional[list[str]],
         typer.Option(
-            "-f", "--file",
+            "-f",
+            "--file",
             help="参考文档路径或网页 URL，可多次指定（支持智能嗅探）",
         ),
     ] = None,
     instructions: Annotated[
         str,
         typer.Option(
-            "-i", "--instructions",
+            "-i",
+            "--instructions",
             help="给 Agent 的额外写作要求或目标读者定位",
         ),
     ] = "",
     model: Annotated[
         Optional[str],
         typer.Option(
-            "-m", "--model",
+            "-m",
+            "--model",
             help="LLM 模型名称（默认读取环境变量 LLM_MODEL 或根据端点自动推导）",
         ),
     ] = None,
@@ -184,7 +193,8 @@ def write(
     output_dir: Annotated[
         str,
         typer.Option(
-            "-o", "--output-dir",
+            "-o",
+            "--output-dir",
             help="生成文章的输出保存目录",
         ),
     ] = "output",
@@ -209,7 +219,9 @@ def write(
     if not final_topic:
         console.print("\n[bold cyan]🪶 欢迎使用 zylo 智能写作向导[/bold cyan]\n")
         final_topic = typer.prompt("📌 请输入文章主题").strip()
-        source_in = typer.prompt("📚 参考文件或论文链接 [直接回车跳过]", default="").strip()
+        source_in = typer.prompt(
+            "📚 参考文件或论文链接 [直接回车跳过]", default=""
+        ).strip()
         if source_in:
             all_sources.append(source_in)
 
@@ -285,9 +297,7 @@ def check():
 
     # LLM Model & Endpoint
     model_status = (
-        "[green]✓ 已配置[/green]"
-        if os.getenv("LLM_MODEL")
-        else "[cyan]• 默认[/cyan]"
+        "[green]✓ 已配置[/green]" if os.getenv("LLM_MODEL") else "[cyan]• 默认[/cyan]"
     )
     table.add_row("LLM 模型", model_status, config.model)
 
@@ -349,7 +359,10 @@ def main():
     raw_args = sys.argv[1:]
     if raw_args:
         first = raw_args[0]
-        if first not in ("--help", "-h", "--install-completion", "--show-completion") and first not in subcommands:
+        if (
+            first not in ("--help", "-h", "--install-completion", "--show-completion")
+            and first not in subcommands
+        ):
             sys.argv.insert(1, "write")
     else:
         # 用户仅输入了 `zylo`，唤醒 write 交互式向导

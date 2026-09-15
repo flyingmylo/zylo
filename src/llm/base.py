@@ -28,4 +28,4 @@ class LLMProvider(ABC):
         response_format: dict[str, str] | None = None,
     ) -> LLMResponse:
         """统一异步聊天接口"""
-        pass
+        ...

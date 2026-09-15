@@ -1,7 +1,7 @@
 import os
 import re
-from datetime import datetime
-from typing import Callable
+from collections.abc import Callable
+from datetime import UTC, datetime
 
 from src.agents.planner import PlannerAgent
 from src.agents.researcher import ResearcherAgent
@@ -127,7 +127,7 @@ class WritingOrchestrator:
     def _format_final_markdown(self, state: WritingState) -> str:
         header = f"""---
 title: {state.outline_title}
-date: {datetime.now().strftime("%Y-%m-%d")}
+date: {datetime.now(UTC).strftime("%Y-%m-%d")}
 topic: {state.topic}
 review_score: {state.review_score}
 total_words: {len(state.full_draft)}
@@ -146,7 +146,7 @@ total_words: {len(state.full_draft)}
     def _export_to_file(self, state: WritingState, output_dir: str = "output") -> str:
         os.makedirs(output_dir, exist_ok=True)
         safe_title = re.sub(r'[\\/*?:"<>| ]', "_", state.outline_title)[:40]
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
         filename = f"{safe_title}_{timestamp}.md"
         filepath = os.path.join(output_dir, filename)
 

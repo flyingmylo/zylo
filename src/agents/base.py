@@ -1,9 +1,12 @@
 import json
+import logging
 from abc import ABC, abstractmethod
 from typing import Any
 
 from src.llm.base import LLMProvider, LLMResponse
 from src.state import WritingState
+
+logger = logging.getLogger(__name__)
 
 
 class BaseAgent(ABC):
@@ -51,7 +54,8 @@ class BaseAgent(ABC):
                 return f"Error: Tool '{name}' has no execution method."
             return json.dumps(res, ensure_ascii=False)
         except Exception as e:
-            return f"Error executing tool '{name}': {str(e)}"
+            logger.exception("工具 '%s' 执行失败", name)  # 完整 traceback 进日志
+            return f"Error executing tool '{name}': {type(e).__name__}：{e!s}"
 
     async def _chat_with_tools(
         self,
@@ -109,5 +113,6 @@ class BaseAgent(ABC):
                         "content": tool_output,
                     }
                 )
-
+        if final_resp is None:
+            raise RuntimeError("工具调用循环未获得任何 LLM 响应。")
         return final_resp

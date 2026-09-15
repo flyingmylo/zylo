@@ -2,9 +2,11 @@ import hashlib
 import os
 import re
 import urllib.parse
+
 import httpx
 import pymupdf
 from rich.console import Console
+
 from src.tools.web_reader import WebReader
 
 console = Console()
@@ -87,7 +89,9 @@ class DocumentReader:
         source = source.strip()
 
         # 1. 本地已有文件优先读取 (当前目录或 cache_dir 目录)
-        if os.path.exists(source) or os.path.exists(os.path.join(self.cache_dir, source)):
+        if os.path.exists(source) or os.path.exists(
+            os.path.join(self.cache_dir, source)
+        ):
             return self.read_file(source)
 
         # 2. 正则识别 arXiv 论文（支持 URL、arxiv:ID、纯数字 ID）
@@ -120,7 +124,9 @@ class DocumentReader:
         else:
             return self._read_text(actual_path)
 
-    async def _read_arxiv(self, arxiv_id: str, original_source: str) -> list[dict[str, str]]:
+    async def _read_arxiv(
+        self, arxiv_id: str, original_source: str
+    ) -> list[dict[str, str]]:
         """
         处理 arXiv 论文：
         1. 检查 references/ 下是否已有 arxiv_<id>.pdf 本地持久化缓存
@@ -149,7 +155,9 @@ class DocumentReader:
 
         for target in [pdf_url, fallback_url]:
             try:
-                async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
+                async with httpx.AsyncClient(
+                    timeout=45.0, follow_redirects=True
+                ) as client:
                     res = await client.get(target, headers=headers)
                     content_type = res.headers.get("content-type", "").lower()
                     if res.status_code == 200 and (
