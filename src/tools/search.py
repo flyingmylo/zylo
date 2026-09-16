@@ -8,15 +8,14 @@ class SearchTool:
     """
     Tavily 联网搜索封装
     专为 AI Agent 设计，返回已清洗后的结构化网页摘要与原始正文
+
+    实现 src.tools.base.Tool 协议，可注册给 BaseAgent 供 LLM 调用
     """
 
     def __init__(self, api_key: str | None = None):
         self.api_key = api_key or os.getenv("TAVILY_API_KEY", "")
         self.client = TavilyClient(api_key=self.api_key) if self.api_key else None
-
-    @property
-    def schema(self) -> dict[str, Any]:
-        return {
+        self.schema: dict[str, Any] = {
             "type": "function",
             "function": {
                 "name": "web_search",
@@ -38,6 +37,20 @@ class SearchTool:
                 },
             },
         }
+
+    async def execute(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """Tool 协议入口：供 LLM Function Calling 调用。
+
+        只接受 Schema 中声明过的参数，未声明的键（如 max_results）一律忽略，
+        避免模型借此影响检索次数与配额消耗。
+        """
+        query = kwargs.get("query")
+        if not query:
+            raise ValueError("缺少必需参数 query")
+        depth = kwargs.get("search_depth", "basic")
+        if depth not in ("basic", "advanced"):
+            depth = "basic"
+        return await self.search(query=query, search_depth=depth)
 
     async def search(
         self, query: str, search_depth: str = "basic", max_results: int = 5

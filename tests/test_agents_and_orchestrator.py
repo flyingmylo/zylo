@@ -11,7 +11,7 @@ from src.state import Stage
 class MockLLMProvider(LLMProvider):
     """用于测试的 Mock LLM，根据 Prompt 角色模拟返回不同 Agent 的响应"""
 
-    async def chat(self, messages, tools=None, temperature=0.7, response_format=None):
+    async def chat(self, messages, tools=None, temperature=0.7):
         system_msg = messages[0]["content"] if messages else ""
         user_msg = messages[-1]["content"] if messages else ""
 
@@ -118,7 +118,7 @@ class MultiRoundMockLLM(LLMProvider):
     def __init__(self):
         self.review_round = 0
 
-    async def chat(self, messages, tools=None, temperature=0.7, response_format=None):
+    async def chat(self, messages, tools=None, temperature=0.7):
         system_msg = messages[0]["content"] if messages else ""
 
         if "技术调研专家" in system_msg:
@@ -194,6 +194,52 @@ async def test_revision_loop_execution(tmp_path):
     assert state.review_passed is True
     assert state.review_score == 95.0
     assert multi_mock.review_round == 2
+
+
+class UsageReportingMock(MockLLMProvider):
+    """在既有 Mock 基础上为每次响应附加 usage，并记录调用次数。"""
+
+    PER_CALL_TOKENS = 15
+
+    def __init__(self):
+        self.call_count = 0
+
+    async def chat(self, messages, tools=None, temperature=0.7):
+        resp = await super().chat(messages, tools, temperature)
+        self.call_count += 1
+        resp.usage = {
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": self.PER_CALL_TOKENS,
+        }
+        return resp
+
+
+@pytest.mark.asyncio
+async def test_token_usage_is_counted_for_every_llm_call(tmp_path):
+    """每一次 LLM 调用都必须被计入 token_usage，并反映到终稿 footer。
+
+    回归保护：Researcher 曾直接调用 llm.chat 绕过统计，导致终稿的总消耗
+    系统性漏掉整个调研阶段。
+    """
+    mock_llm = UsageReportingMock()
+
+    orchestrator = WritingOrchestrator(
+        llm=mock_llm,
+        embedding_provider=DummyEmbeddingProvider(),
+    )
+
+    state = await orchestrator.execute(
+        topic="KV-Cache 显存优化",
+        output_dir=str(tmp_path / "out_tokens"),
+    )
+
+    # 调研 1 + 规划 1 + 逐节写作 2 + 审稿 1 = 5 次调用，每次都恰好被统计一次。
+    # 绝对次数是必要的：只用相对等式的话，整个调研环节被删掉后测试仍会通过。
+    assert mock_llm.call_count == 5
+    assert state.token_usage["total_tokens"] == mock_llm.call_count * 15
+    assert state.token_usage["prompt_tokens"] == mock_llm.call_count * 10
+    assert f"Total: {state.token_usage['total_tokens']}" in state.final_markdown
 
 
 def test_cli_positional_logic():

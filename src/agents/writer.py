@@ -79,7 +79,16 @@ class WriterAgent(BaseAgent):
                 state=state,
                 temperature=0.7,
             )
-            section_drafts[sec.title] = resp.content.strip()
+            content = resp.content.strip()
+            if not content:
+                # 工具调用未收敛等情况下会拿到空正文，宁可留白也不写入空小节
+                state.errors.append(
+                    f"小节「{sec.title}」生成内容为空"
+                    f"（finish_reason={resp.finish_reason}），已跳过。"
+                )
+                self.logger.warning("小节「%s」生成内容为空，已跳过", sec.title)
+                continue
+            section_drafts[sec.title] = content
 
         state.section_drafts = section_drafts
 

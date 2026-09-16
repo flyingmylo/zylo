@@ -16,6 +16,9 @@ class ResearcherAgent(BaseAgent):
     1. 解析本地参考文档（英文论文 / PDF / Markdown）切片入库
     2. 针对技术主题生成搜索词，调用 Tavily 补充网络最新资料
     3. 提取核心事实，生成调研综述，构建当前写作专属的向量知识库
+
+    检索走确定性流程（生成检索词 → 逐条搜索），不经过 Function Calling，
+    因此不向基类注册 tools；LLM 交互统一经 _chat 以便统计 Token。
     """
 
     def __init__(
@@ -28,7 +31,6 @@ class ResearcherAgent(BaseAgent):
             name="Researcher",
             llm=llm,
             system_prompt=RESEARCHER_SYSTEM_PROMPT,
-            tools=[search_tool] if search_tool else [],
         )
         self.kb = knowledge_base
         self.doc_reader = DocumentReader()
@@ -56,7 +58,7 @@ class ResearcherAgent(BaseAgent):
                 },
                 {"role": "user", "content": f"技术主题: {state.topic}"},
             ]
-            kw_resp = await self.llm.chat(kw_prompt, temperature=0.3)
+            kw_resp = await self._chat(kw_prompt, state, temperature=0.3)
             queries = []
             try:
                 content = kw_resp.content.strip()
@@ -94,7 +96,7 @@ class ResearcherAgent(BaseAgent):
                 "content": f"请针对主题【{state.topic}】，结合以下抓取到的代表性核心资料片段，撰写一份系统性调研综述：\n\n{sample_context}",
             },
         ]
-        summary_resp = await self.llm.chat(summary_prompt, temperature=0.5)
+        summary_resp = await self._chat(summary_prompt, state, temperature=0.5)
         state.research_summary = summary_resp.content
 
         return state

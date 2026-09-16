@@ -40,9 +40,6 @@ class ReviewerAgent(BaseAgent):
             messages=messages,
             state=state,
             temperature=0.2,
-            response_format={"type": "json_object"}
-            if "gpt" in getattr(self.llm, "model", "")
-            else None,
         )
 
         raw = resp.content.strip()

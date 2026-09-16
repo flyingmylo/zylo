@@ -37,9 +37,6 @@ class PlannerAgent(BaseAgent):
             messages=messages,
             state=state,
             temperature=0.4,
-            response_format={"type": "json_object"}
-            if "gpt" in getattr(self.llm, "model", "")
-            else None,
         )
 
         raw = resp.content.strip()
