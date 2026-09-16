@@ -25,7 +25,6 @@ class LLMProvider(ABC):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         temperature: float = 0.7,
-        response_format: dict[str, str] | None = None,
     ) -> LLMResponse:
         """统一异步聊天接口"""
         ...

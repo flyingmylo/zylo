@@ -14,9 +14,11 @@ class OpenAICompatibleProvider(LLMProvider):
     def __init__(
         self,
         api_key: str,
+        model: str,
         base_url: str | None = None,
-        model: str = "gpt-4o",
     ):
+        if not model:
+            raise ValueError("必须显式指定模型名称，本项目不提供默认模型。")
         self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self.model = model
 
@@ -25,7 +27,6 @@ class OpenAICompatibleProvider(LLMProvider):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         temperature: float = 0.7,
-        response_format: dict[str, str] | None = None,
     ) -> LLMResponse:
         kwargs: dict[str, Any] = {
             "model": self.model,
@@ -34,8 +35,6 @@ class OpenAICompatibleProvider(LLMProvider):
         }
         if tools:
             kwargs["tools"] = tools
-        if response_format:
-            kwargs["response_format"] = response_format
 
         response = await self.client.chat.completions.create(**kwargs)
         choice = response.choices[0]

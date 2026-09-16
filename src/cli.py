@@ -1,5 +1,4 @@
 import asyncio
-import os
 import sys
 from typing import Annotated, Optional
 
@@ -50,6 +49,14 @@ async def _run_write_async(
         console.print("[bold red]❌ 错误：未检测到 LLM API Key！[/bold red]")
         console.print(
             "请通过环境变量 [cyan]LLM_API_KEY[/cyan] 或参数 [cyan]--api-key[/cyan] 指定。"
+        )
+        raise typer.Exit(code=1)
+
+    if not effective_model:
+        console.print("[bold red]❌ 错误：未检测到模型名称！[/bold red]")
+        console.print(
+            "本项目不提供默认模型，请通过环境变量 [cyan]LLM_MODEL[/cyan] "
+            "或参数 [cyan]--model[/cyan] 显式指定。"
         )
         raise typer.Exit(code=1)
 
@@ -297,9 +304,9 @@ def check():
 
     # LLM Model & Endpoint
     model_status = (
-        "[green]✓ 已配置[/green]" if os.getenv("LLM_MODEL") else "[cyan]• 默认[/cyan]"
+        "[green]✓ 已配置[/green]" if config.model else "[red]✗ 未设置[/red]"
     )
-    table.add_row("LLM 模型", model_status, config.model)
+    table.add_row("LLM 模型", model_status, config.model or "未设置 (必须显式指定)")
 
     base_url_status = (
         "[green]✓ 已配置[/green]" if config.base_url else "[cyan]• 默认[/cyan]"
@@ -341,7 +348,7 @@ def show_config():
     config = LLMConfig()
     console.print(
         Panel.fit(
-            f"🔹 [bold]LLM_MODEL[/bold]: {config.model}\n"
+            f"🔹 [bold]LLM_MODEL[/bold]: {config.model or '(未设置)'}\n"
             f"🔹 [bold]LLM_BASE_URL[/bold]: {config.base_url or '(默认 OpenAI 官方)'}\n"
             f"🔹 [bold]LLM_API_KEY[/bold]: {_mask_key(config.api_key)}\n"
             f"🔹 [bold]LLM_TEMPERATURE[/bold]: {config.temperature}\n"

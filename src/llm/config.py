@@ -6,14 +6,14 @@ from pydantic import BaseModel, Field
 load_dotenv()
 
 
-def _get_default_model() -> str:
-    m = os.getenv("LLM_MODEL")
-    if m and m.strip() and m.strip().lower() != "none":
-        return m.strip()
-    b = os.getenv("LLM_BASE_URL", "")
-    if "deepseek" in b.lower():
-        return "deepseek-v4-pro"
-    return "gpt-4o"
+def _get_model_from_env() -> str:
+    """模型只从环境变量读取，不提供任何默认值。
+
+    未设置时返回空字符串，由调用方（CLI）给出明确报错，
+    避免悄悄用某个硬编码模型去请求一个并不存在的端点。
+    """
+    m = os.getenv("LLM_MODEL", "").strip()
+    return "" if m.lower() in ("", "none") else m
 
 
 def _get_default_rerank() -> str:
@@ -30,7 +30,7 @@ class LLMConfig(BaseModel):
     base_url: str | None = Field(
         default_factory=lambda: os.getenv("LLM_BASE_URL", None)
     )
-    model: str = Field(default_factory=_get_default_model)
+    model: str = Field(default_factory=_get_model_from_env)
     temperature: float = Field(
         default_factory=lambda: float(os.getenv("LLM_TEMPERATURE", "0.7"))
     )
