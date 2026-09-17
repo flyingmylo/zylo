@@ -11,6 +11,7 @@ from src.llm.base import LLMProvider, LLMResponse, ToolCall
 from src.state import SectionSpec, WritingState
 from src.tools.base import Tool
 from src.tools.search import SearchTool
+from src.tools.web_reader import WebReader
 
 
 class ScriptedLLM(LLMProvider):
@@ -414,12 +415,15 @@ async def test_search_tool_execute_rejects_invalid_depth_and_missing_query(monke
 class StubSearchTool:
     """Researcher 的确定性检索替身，不满足 Tool 协议也不需要满足。"""
 
-    def __init__(self):
+    def __init__(self, results: list[dict] | None = None):
         self.queries: list[str] = []
+        self._results = results or [
+            {"title": "T", "url": "https://example.com", "content": "检索到的片段"}
+        ]
 
     async def search(self, query, max_results=5):
         self.queries.append(query)
-        return [{"title": "T", "url": "https://example.com", "content": "检索到的片段"}]
+        return [dict(r) for r in self._results]
 
 
 class FakeKnowledgeBase:
@@ -439,12 +443,17 @@ class FakeKnowledgeBase:
 
 
 @pytest.mark.asyncio
-async def test_researcher_token_usage_regression():
+async def test_researcher_token_usage_regression(monkeypatch):
     """回归：调研阶段两次 LLM 调用都必须计入 token_usage。
 
     修复前 Researcher 直接调 llm.chat，绕过了基类的统计入口，
     导致终稿展示的总消耗漏掉整个调研阶段。
     """
+
+    async def no_fetch(url, timeout=10.0):
+        return ""  # 原文抓取一律失败，走摘要兜底，测试不发起真实网络请求
+
+    monkeypatch.setattr(WebReader, "fetch_and_clean", no_fetch)
     search_tool = StubSearchTool()
     llm = ScriptedLLM(
         [
@@ -476,6 +485,89 @@ async def test_researcher_token_usage_regression():
     assert state.token_usage["total_tokens"] == 330
     # 调研阶段不注册工具，检索走确定性流程
     assert agent._get_tool_schemas() is None
+
+
+@pytest.mark.asyncio
+async def test_researcher_ingests_fulltext_with_snippet_fallback(monkeypatch):
+    """搜索结果优先抓原文切块入库；失败/过短/重复 URL 一律降级为摘要。"""
+    search_tool = StubSearchTool(
+        results=[
+            {"title": "好文", "url": "https://good.com", "content": "好文摘要"},
+            {"title": "坏文", "url": "https://bad.com", "content": "坏文摘要"},
+            {"title": "短文", "url": "https://short.com", "content": "短文摘要"},
+            {"title": "重复", "url": "https://good.com", "content": "重复摘要"},
+        ]
+    )
+    fetched: list[str] = []
+
+    async def fake_fetch(url, timeout=10.0):
+        fetched.append(url)
+        if url == "https://good.com":
+            return "这是抓取到的完整正文，包含充分的技术细节。" * 30
+        if url == "https://short.com":
+            return "太短的正文"
+        return ""
+
+    monkeypatch.setattr(WebReader, "fetch_and_clean", fake_fetch)
+
+    llm = ScriptedLLM(
+        [
+            LLMResponse(content='["检索词"]'),
+            LLMResponse(content="调研综述正文"),
+        ]
+    )
+    kb = FakeKnowledgeBase()
+    agent = ResearcherAgent(llm, knowledge_base=kb, search_tool=search_tool)
+
+    state = await agent.run(WritingState(topic="t"))
+
+    # URL 去重：重复的 good.com 只抓取一次
+    assert sorted(fetched) == ["https://bad.com", "https://good.com", "https://short.com"]
+
+    good = [d for d in kb.documents if d["source"] == "https://good.com"]
+    assert good, "抓到原文的 URL 必须以全文切块入库"
+    assert all("完整正文" in d["text"] for d in good)
+    assert all("好文摘要" not in d["text"] for d in good), "全文成功后摘要不应再入库"
+
+    for url, marker in [
+        ("https://bad.com", "坏文摘要"),
+        ("https://short.com", "短文摘要"),
+    ]:
+        fallback = [d for d in kb.documents if d["source"] == url]
+        assert len(fallback) == 1 and marker in fallback[0]["text"]
+
+    assert state.research_summary == "调研综述正文"
+
+
+@pytest.mark.asyncio
+async def test_researcher_fulltext_fetch_is_capped(monkeypatch):
+    """原文抓取有上限，超出上限的搜索结果仍以摘要兜底入库，不静默丢弃。"""
+    results = [
+        {"title": f"t{i}", "url": f"https://x.com/{i}", "content": f"摘要{i}"}
+        for i in range(10)
+    ]
+    search_tool = StubSearchTool(results=results)
+    fetched: list[str] = []
+
+    async def no_fetch(url, timeout=10.0):
+        fetched.append(url)
+        return ""
+
+    monkeypatch.setattr(WebReader, "fetch_and_clean", no_fetch)
+
+    llm = ScriptedLLM(
+        [
+            LLMResponse(content='["检索词"]'),
+            LLMResponse(content="调研综述正文"),
+        ]
+    )
+    kb = FakeKnowledgeBase()
+    agent = ResearcherAgent(llm, knowledge_base=kb, search_tool=search_tool)
+
+    await agent.run(WritingState(topic="t"))
+
+    assert len(fetched) == 8  # 只尝试前 8 条
+    assert len(kb.documents) == 10  # 10 条全部以摘要形式入库
 
 
 # --------------------------------------------------------------------------

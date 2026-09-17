@@ -184,15 +184,7 @@ class DocumentReader:
         abs_url = f"https://arxiv.org/abs/{arxiv_id}"
         text = await WebReader.fetch_and_clean(abs_url)
         if text:
-            chunks = self._split_text(text)
-            return [
-                {
-                    "text": c,
-                    "source": original_source,
-                    "page": "1",
-                }
-                for c in chunks
-            ]
+            return self.chunk_text(text, source=original_source)
 
         raise RuntimeError(f"未能成功拉取 arXiv 论文内容: {arxiv_id}")
 
@@ -233,20 +225,11 @@ class DocumentReader:
             # 否则作为普通网页抓取
             text = await WebReader.fetch_and_clean(url)
             if text:
-                chunks = self._split_text(text)
-                return [
-                    {
-                        "text": c,
-                        "source": url,
-                        "page": "1",
-                    }
-                    for c in chunks
-                ]
+                return self.chunk_text(text, source=url)
         except Exception:
             text = await WebReader.fetch_and_clean(url)
             if text:
-                chunks = self._split_text(text)
-                return [{"text": c, "source": url, "page": "1"} for c in chunks]
+                return self.chunk_text(text, source=url)
 
         return []
 
@@ -282,6 +265,17 @@ class DocumentReader:
                 "page": "1",
             }
             for c in text_chunks
+        ]
+
+    def chunk_text(self, text: str, source: str) -> list[dict[str, str]]:
+        """通用文本切块入口：供搜索原文等外部抓取文本入库复用。"""
+        return [
+            {
+                "text": c,
+                "source": source,
+                "page": "1",
+            }
+            for c in self._split_text(text)
         ]
 
     def _split_text(self, text: str) -> list[str]:

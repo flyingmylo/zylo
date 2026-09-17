@@ -1,20 +1,30 @@
 import json
 
+import asyncio
+
 from src.llm.base import LLMProvider
 from src.prompts import RESEARCHER_SYSTEM_PROMPT
 from src.state import Stage, WritingState
 from src.tools.knowledge_base import KnowledgeBase
 from src.tools.pdf_reader import DocumentReader
 from src.tools.search import SearchTool
+from src.tools.web_reader import WebReader
 
 from .base import BaseAgent
+
+# 单次调研抓取搜索结果原文的 URL 上限与并发度
+MAX_FULLTEXT_FETCH = 8
+FETCH_CONCURRENCY = 4
+# 清洗后正文低于该长度大概率是反爬空壳页，降级用搜索摘要
+MIN_FULLTEXT_CHARS = 400
 
 
 class ResearcherAgent(BaseAgent):
     """
     调研员 Agent：
     1. 解析本地参考文档（英文论文 / PDF / Markdown）切片入库
-    2. 针对技术主题生成搜索词，调用 Tavily 补充网络最新资料
+    2. 针对技术主题生成搜索词，调用 Tavily 补充网络最新资料，
+       并优先抓取搜索结果原文入库（摘要仅作抓取失败的兜底）
     3. 提取核心事实，生成调研综述，构建当前写作专属的向量知识库
 
     检索走确定性流程（生成检索词 → 逐条搜索），不经过 Function Calling，
@@ -70,17 +80,29 @@ class ResearcherAgent(BaseAgent):
             except Exception:
                 queries = [state.topic]
 
+            fetch_candidates: list[dict] = []
+            seen_urls: set[str] = set()
             for q in queries[:4]:
                 search_results = await self.search_tool.search(q, max_results=3)
                 for r in search_results:
-                    if r.get("content"):
-                        all_chunks.append(
-                            {
-                                "text": f"来源标题: {r.get('title')}\nURL: {r.get('url')}\n内容: {r.get('content')}",
-                                "source": r.get("url") or "web_search",
-                                "page": "1",
-                            }
-                        )
+                    if not r.get("content"):
+                        continue
+                    url = (r.get("url") or "").strip()
+                    snippet = {
+                        "text": f"来源标题: {r.get('title')}\nURL: {url}\n内容: {r.get('content')}",
+                        "source": url or "web_search",
+                        "page": "1",
+                    }
+                    if not url:
+                        all_chunks.append(snippet)
+                        continue
+                    if url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    fetch_candidates.append({"url": url, "snippet": snippet})
+
+            # 摘要只是兜底：优先并发抓取原文，材料深度直接决定文章可达到的质量上限
+            all_chunks.extend(await self._fetch_fulltext(fetch_candidates))
 
         # 3. 全部数据持久化入向量库
         if all_chunks:
@@ -100,3 +122,31 @@ class ResearcherAgent(BaseAgent):
         state.research_summary = summary_resp.content
 
         return state
+
+    async def _fetch_fulltext(
+        self, candidates: list[dict[str, str]]
+    ) -> list[dict[str, str]]:
+        """并发抓取搜索结果原文切块入库。
+
+        前 MAX_FULLTEXT_FETCH 条抓全文；超出上限与抓取失败的条目一律降级为
+        搜索摘要，任何单条失败都不会中断调研流程。
+        """
+        if not candidates:
+            return []
+        to_fetch, rest = candidates[:MAX_FULLTEXT_FETCH], candidates[MAX_FULLTEXT_FETCH:]
+        sem = asyncio.Semaphore(FETCH_CONCURRENCY)
+        batches = await asyncio.gather(*(self._fetch_one(c, sem) for c in to_fetch))
+        chunks = [chunk for batch in batches for chunk in batch]
+        chunks.extend(c["snippet"] for c in rest)
+        return chunks
+
+    async def _fetch_one(
+        self, candidate: dict[str, str], sem: asyncio.Semaphore
+    ) -> list[dict[str, str]]:
+        url = candidate["url"]
+        async with sem:
+            text = await WebReader.fetch_and_clean(url)
+        if len(text) >= MIN_FULLTEXT_CHARS:
+            return self.doc_reader.chunk_text(text, source=url)
+        self.logger.info("原文抓取失败或正文过短，降级使用搜索摘要: %s", url)
+        return [candidate["snippet"]]
