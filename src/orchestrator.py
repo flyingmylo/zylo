@@ -80,6 +80,7 @@ class WritingOrchestrator:
         )
 
         # ====== 阶段 3 & 4: 写作与审稿反思回路 ======
+        best_snapshot: dict | None = None
         while state.revision_count <= state.max_revisions:
             round_desc = (
                 "初稿撰写"
@@ -99,12 +100,36 @@ class WritingOrchestrator:
                 state,
             )
 
+            # 记录历史最优稿：审稿无单调保证，强制定稿时回填最优轮，
+            # 避免「最后一轮」覆盖「最好一轮」
+            if best_snapshot is None or state.review_score > best_snapshot["score"]:
+                best_snapshot = {
+                    "round": state.revision_count,
+                    "score": state.review_score,
+                    "section_drafts": dict(state.section_drafts),
+                    "full_draft": state.full_draft,
+                }
+
             if state.review_passed:
                 self.on_progress("🎉 审稿通过，符合发布质量！", state)
                 break
 
             state.revision_count += 1
             if state.revision_count > state.max_revisions:
+                if best_snapshot["score"] > state.review_score:
+                    state.review_score = best_snapshot["score"]
+                    state.section_drafts = best_snapshot["section_drafts"]
+                    state.full_draft = best_snapshot["full_draft"]
+                    best_round_desc = (
+                        "初稿"
+                        if best_snapshot["round"] == 0
+                        else f"第 {best_snapshot['round']} 轮修改稿"
+                    )
+                    self.on_progress(
+                        f"🏅 当前终稿非历史最优，已回退保留{best_round_desc}"
+                        f"（{best_snapshot['score']:.1f} 分）...",
+                        state,
+                    )
                 self.on_progress(
                     f"⚠️ 已达到最大修改轮次 ({state.max_revisions} 轮)，强制定稿。",
                     state,

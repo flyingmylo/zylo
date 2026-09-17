@@ -196,6 +196,107 @@ async def test_revision_loop_execution(tmp_path):
     assert multi_mock.review_round == 2
 
 
+class FluctuatingReviewMock(LLMProvider):
+    """模拟审稿分数逐轮波动直至强制定稿的多轮回路（复现 78.5→64.5→76.5 日志）"""
+
+    def __init__(self, scores: list[float]):
+        self.scores = list(scores)
+        self.writer_round = 0
+        self.review_round = 0
+
+    async def chat(self, messages, tools=None, temperature=0.7):
+        system_msg = messages[0]["content"] if messages else ""
+
+        if "技术调研专家" in system_msg:
+            return LLMResponse(content="调研综述：长上下文显存开销。")
+
+        if "架构规划专家" in system_msg:
+            outline_json = {
+                "outline_title": "长上下文显存优化",
+                "target_total_words": 1000,
+                "sections": [
+                    {
+                        "title": "一、核心原理",
+                        "target_words": 500,
+                        "focus_points": ["核心要点"],
+                        "retrieval_query_zh": "显存优化 原理",
+                        "retrieval_query_en": "memory optimization principles",
+                    }
+                ],
+            }
+            return LLMResponse(content=json.dumps(outline_json))
+
+        if "技术作家" in system_msg:
+            self.writer_round += 1
+            return LLMResponse(content=f"### 第{self.writer_round}轮正文")
+
+        if "审稿专家" in system_msg:
+            score = self.scores[min(self.review_round, len(self.scores) - 1)]
+            self.review_round += 1
+            return LLMResponse(
+                content=json.dumps(
+                    {
+                        "passed": False,
+                        "score": score,
+                        "critiques": ["技术深度不足。"],
+                        "actionable_revisions": [
+                            {"section": "一、核心原理", "advice": "补充实测数据"}
+                        ],
+                    }
+                )
+            )
+
+        return LLMResponse(content="默认响应")
+
+
+@pytest.mark.asyncio
+async def test_best_draft_is_restored_on_forced_finalize(tmp_path):
+    """审稿分数随机游走时，强制定稿必须回填历史最优稿而非使用最后一轮。"""
+    mock = FluctuatingReviewMock([78.5, 64.5, 76.5])
+    progress: list[str] = []
+
+    orchestrator = WritingOrchestrator(
+        llm=mock,
+        embedding_provider=DummyEmbeddingProvider(),
+        progress_callback=lambda msg, state: progress.append(msg),
+    )
+
+    state = await orchestrator.execute(
+        topic="长上下文显存优化",
+        output_dir=str(tmp_path / "out_best"),
+    )
+
+    assert mock.review_round == 3  # 初稿 + 2 轮修改全部审完，均未通过
+    assert state.review_passed is False
+    assert state.review_score == 78.5
+    assert "第1轮正文" in state.full_draft
+    assert "第3轮正文" not in state.full_draft
+    assert any("已回退保留初稿" in m for m in progress)
+    assert "review_score: 78.5" in state.final_markdown
+
+
+@pytest.mark.asyncio
+async def test_no_backfill_when_final_round_is_best(tmp_path):
+    """末轮本就是历史最优（或并列）时保持现状，不做无谓回退。"""
+    mock = FluctuatingReviewMock([70.0, 80.0, 90.0])
+    progress: list[str] = []
+
+    orchestrator = WritingOrchestrator(
+        llm=mock,
+        embedding_provider=DummyEmbeddingProvider(),
+        progress_callback=lambda msg, state: progress.append(msg),
+    )
+
+    state = await orchestrator.execute(
+        topic="长上下文显存优化",
+        output_dir=str(tmp_path / "out_ascending"),
+    )
+
+    assert state.review_score == 90.0
+    assert "第3轮正文" in state.full_draft
+    assert not any("回退保留" in m for m in progress)
+
+
 class UsageReportingMock(MockLLMProvider):
     """在既有 Mock 基础上为每次响应附加 usage，并记录调用次数。"""
 
