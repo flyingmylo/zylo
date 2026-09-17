@@ -1,6 +1,6 @@
 from src.llm.base import LLMProvider
 from src.prompts import WRITER_SYSTEM_PROMPT
-from src.state import Stage, WritingState
+from src.state import GLOBAL_SCOPE, Stage, WritingState
 from src.tools.knowledge_base import KnowledgeBase
 
 from .base import BaseAgent
@@ -12,7 +12,7 @@ class WriterAgent(BaseAgent):
     1. 逐章节执行靶向双语向量检索（兼顾中文资料与英文论文）
     2. 严格执行跨语言写作规范：输出通顺纯正的中文技术表达
     3. 专业概念强制执行「中文译名（English Name）」双语对照
-    4. 支持审稿反思回路下的局部定向重写与润色
+    4. 修订轮在上一版正文基础上定向重写被点名的小节，未点名小节原样保留
     """
 
     def __init__(self, llm: LLMProvider, knowledge_base: KnowledgeBase):
@@ -24,9 +24,43 @@ class WriterAgent(BaseAgent):
             Stage.WRITING if state.revision_count == 0 else Stage.REVISING
         )
 
+        previous_drafts = dict(state.section_drafts)
+        is_revision = state.revision_count > 0 and bool(previous_drafts)
+
+        # 1. 意见分组：定位到小节的意见进入 section_notes，其余（含全局）进入 global_notes
+        all_titles = {sec.title for sec in state.sections}
+        section_notes: dict[str, list[str]] = {}
+        global_notes: list[str] = []
+        if is_revision:
+            for rev in state.actionable_revisions:
+                advice = str(rev.get("advice", "")).strip()
+                scope = str(rev.get("section", "")).strip()
+                if not advice:
+                    continue
+                if scope in all_titles:
+                    section_notes.setdefault(scope, []).append(advice)
+                else:
+                    global_notes.append(advice)
+
+        # 2. 圈定本轮需要重写的小节：定向点名优先；
+        #    只有全局意见（或没有意见）时全量重写，但同样基于上一版正文做修订
+        if is_revision and section_notes:
+            targeted_titles = set(section_notes)
+            # 初稿轮被跳过的小节没有旧稿可复用，必须趁修订轮补写
+            targeted_titles |= {
+                t for t in all_titles if t not in previous_drafts
+            }
+        else:
+            targeted_titles = set(all_titles)
+
         section_drafts = {}
-        for idx, sec in enumerate(state.sections):
-            # 1. 执行精准双语检索
+        for sec in state.sections:
+            # 3. 未被点名且已有上一版的小节：原样保留，零 LLM 成本，修复自动累积
+            if is_revision and sec.title not in targeted_titles:
+                section_drafts[sec.title] = previous_drafts[sec.title]
+                continue
+
+            # 4. 执行精准双语检索
             retrieved_chunks = self.kb.retrieve(
                 query_zh=sec.retrieval_query_zh,
                 query_en=sec.retrieval_query_en,
@@ -44,19 +78,29 @@ class WriterAgent(BaseAgent):
             else:
                 context_str = "本节无特定检索参考资料，请根据总体技术脉络严谨推演编写。"
 
-            # 2. 审稿反思建议注入（如果处于修改阶段）
+            # 5. 修订轮注入：本节意见 + 全局意见 + 上一版正文
             revision_note = ""
-            if state.actionable_revisions and state.revision_count > 0:
-                matching_revisions = [
-                    rev
-                    for rev in state.actionable_revisions
-                    if sec.title in rev or f"第{idx + 1}节" in rev or "全局" in rev
-                ]
-                if matching_revisions:
+            if is_revision:
+                notes = section_notes.get(sec.title, []) + global_notes
+                if notes:
                     revision_note = (
-                        "\n【上一轮审稿人对本节的修改意见，请务必针对性优化】:\n"
-                        + "\n".join([f"- {r}" for r in matching_revisions])
+                        "\n【上一轮审稿人的修改意见，请务必针对性优化】:\n"
+                        + "\n".join([f"- {n}" for n in notes])
                     )
+
+            previous_block = ""
+            if is_revision and sec.title in previous_drafts:
+                previous_block = (
+                    "【本节上一版正文（请在此基础上修订，未涉及部分保持稳定，"
+                    "不要整节推倒重写）】：\n"
+                    f"{previous_drafts[sec.title]}\n\n"
+                )
+
+            closing_line = (
+                "请基于上一版正文完成修订，直接输出本小节修订后的完整 Markdown 正文（包含小节二级/三级标题）："
+                if is_revision and sec.title in previous_drafts
+                else "请开始撰写本小节的完整 Markdown 正文（包含小节二级/三级标题）："
+            )
 
             user_prompt = f"""【文章全局大标题】：{state.outline_title}
 【当前撰写小节】：{sec.title}
@@ -64,29 +108,39 @@ class WriterAgent(BaseAgent):
 【本节必须涵盖要点】：{", ".join(sec.focus_points)}
 {revision_note}
 
-【检索到的参考资料片段（包含中/英文背景）】：
+{previous_block}【检索到的参考资料片段（包含中/英文背景）】：
 {context_str}
 
-请开始撰写本小节的完整 Markdown 正文（包含小节二级/三级标题）："""
+{closing_line}"""
 
             messages = [
                 {"role": "system", "content": self.system_prompt},
                 {"role": "user", "content": user_prompt},
             ]
 
+            # 修订是编辑任务，用低温度收敛；初稿才需要发散
             resp = await self._chat_with_tools(
                 messages=messages,
                 state=state,
-                temperature=0.7,
+                temperature=0.3 if is_revision else 0.7,
             )
             content = resp.content.strip()
             if not content:
-                # 工具调用未收敛等情况下会拿到空正文，宁可留白也不写入空小节
-                state.errors.append(
-                    f"小节「{sec.title}」生成内容为空"
-                    f"（finish_reason={resp.finish_reason}），已跳过。"
-                )
-                self.logger.warning("小节「%s」生成内容为空，已跳过", sec.title)
+                if is_revision and sec.title in previous_drafts:
+                    # 定向重写失败绝不能丢掉上一版内容
+                    state.errors.append(
+                        f"小节「{sec.title}」修订生成内容为空"
+                        f"（finish_reason={resp.finish_reason}），已保留上一版。"
+                    )
+                    self.logger.warning("小节「%s」修订内容为空，保留上一版", sec.title)
+                    section_drafts[sec.title] = previous_drafts[sec.title]
+                else:
+                    # 工具调用未收敛等情况下会拿到空正文，宁可留白也不写入空小节
+                    state.errors.append(
+                        f"小节「{sec.title}」生成内容为空"
+                        f"（finish_reason={resp.finish_reason}），已跳过。"
+                    )
+                    self.logger.warning("小节「%s」生成内容为空，已跳过", sec.title)
                 continue
             section_drafts[sec.title] = content
 

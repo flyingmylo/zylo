@@ -5,6 +5,7 @@ import pytest
 
 from src.agents.base import BaseAgent
 from src.agents.researcher import ResearcherAgent
+from src.agents.reviewer import ReviewerAgent
 from src.agents.writer import WriterAgent
 from src.llm.base import LLMProvider, LLMResponse, ToolCall
 from src.state import SectionSpec, WritingState
@@ -25,6 +26,7 @@ class ScriptedLLM(LLMProvider):
             {
                 "messages": [dict(m) for m in messages],
                 "tools": tools,
+                "temperature": temperature,
             }
         )
         if not self.responses:
@@ -499,3 +501,207 @@ async def test_writer_skips_empty_section_and_records_error(caplog):
     assert "tool_calls" in state.errors[0]  # finish_reason 一并暴露，便于定位
     assert "一、原理" not in state.full_draft
     assert any("生成内容为空" in r.getMessage() for r in caplog.records)
+
+
+# --------------------------------------------------------------------------
+# Reviewer 结构化意见解析与规范化
+# --------------------------------------------------------------------------
+
+
+def _review_state(titles: list[str]) -> WritingState:
+    state = WritingState(topic="t", outline_title="标题", full_draft="全文正文")
+    state.sections = [SectionSpec(title=t, target_words=100) for t in titles]
+    return state
+
+
+def _review_json(revisions) -> str:
+    return json.dumps(
+        {
+            "passed": False,
+            "score": 78.5,
+            "critiques": ["c"],
+            "actionable_revisions": revisions,
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_reviewer_parses_structured_revisions():
+    llm = ScriptedLLM(
+        [
+            LLMResponse(
+                content=_review_json(
+                    [
+                        {"section": "一、原理", "advice": "补充显存对比数据"},
+                        {"section": "全局", "advice": "统一术语双语对照"},
+                    ]
+                )
+            )
+        ]
+    )
+    agent = ReviewerAgent(llm)
+    state = _review_state(["一、原理", "二、实践"])
+
+    state = await agent.run(state)
+
+    assert state.review_score == 78.5
+    assert state.review_passed is False
+    assert state.actionable_revisions == [
+        {"section": "一、原理", "advice": "补充显存对比数据"},
+        {"section": "全局", "advice": "统一术语双语对照"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reviewer_normalizes_legacy_string_revisions():
+    """模型偶发输出纯字符串旧格式：标题出现在文本里则归属该节，否则归全局。"""
+    llm = ScriptedLLM(
+        [
+            LLMResponse(
+                content=_review_json(
+                    [
+                        "一、核心原理：请务必增加键值缓存（KV-Cache）双语对照。",
+                        "语言整体偏生硬。",
+                    ]
+                )
+            )
+        ]
+    )
+    agent = ReviewerAgent(llm)
+    state = _review_state(["一、核心原理", "二、实践"])
+
+    state = await agent.run(state)
+
+    assert state.actionable_revisions == [
+        {
+            "section": "一、核心原理",
+            "advice": "一、核心原理：请务必增加键值缓存（KV-Cache）双语对照。",
+        },
+        {"section": "全局", "advice": "语言整体偏生硬。"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reviewer_fuzzy_scope_match_and_global_fallback(caplog):
+    """section 与标题不完全一致时按包含关系匹配；完全匹配不上必须归全局并告警。"""
+    llm = ScriptedLLM(
+        [
+            LLMResponse(
+                content=_review_json(
+                    [
+                        {"section": "核心原理", "advice": "补充公式推导"},
+                        {"section": "第二节", "advice": "调整详略"},
+                    ]
+                )
+            )
+        ]
+    )
+    agent = ReviewerAgent(llm)
+    state = _review_state(["一、核心原理", "二、实践"])
+
+    with caplog.at_level(logging.WARNING):
+        state = await agent.run(state)
+
+    assert state.actionable_revisions[0]["section"] == "一、核心原理"
+    assert state.actionable_revisions[1]["section"] == "全局"
+    assert any("归入全局" in r.getMessage() for r in caplog.records)
+
+
+# --------------------------------------------------------------------------
+# Writer 修订轮定向重写
+# --------------------------------------------------------------------------
+
+
+def _revision_state() -> WritingState:
+    state = WritingState(topic="t", outline_title="标题", full_draft="旧全文")
+    state.sections = [
+        SectionSpec(title="一、原理", target_words=100),
+        SectionSpec(title="二、实践", target_words=100),
+    ]
+    state.section_drafts = {"一、原理": "旧版原理", "二、实践": "旧版实践"}
+    state.revision_count = 1
+    return state
+
+
+@pytest.mark.asyncio
+async def test_revision_round_rewrites_only_targeted_sections():
+    """被点名的小节才走 LLM，未点名小节原样保留上一版，修复自动累积。"""
+    state = _revision_state()
+    state.actionable_revisions = [{"section": "一、原理", "advice": "补充数据"}]
+    llm = ScriptedLLM([LLMResponse(content="新版原理")])
+    agent = WriterAgent(llm, knowledge_base=FakeKnowledgeBase())
+
+    state = await agent.run(state)
+
+    assert state.section_drafts == {"一、原理": "新版原理", "二、实践": "旧版实践"}
+    assert len(llm.calls) == 1
+    assert "新版原理" in state.full_draft
+    assert "旧版实践" in state.full_draft
+
+
+@pytest.mark.asyncio
+async def test_revision_prompt_carries_previous_draft_notes_and_low_temperature():
+    state = _revision_state()
+    state.actionable_revisions = [
+        {"section": "一、原理", "advice": "补充显存对比数据"},
+        {"section": "全局", "advice": "统一术语对照"},
+    ]
+    llm = ScriptedLLM([LLMResponse(content="新版原理")])
+    agent = WriterAgent(llm, knowledge_base=FakeKnowledgeBase())
+
+    await agent.run(state)
+
+    user_prompt = llm.calls[0]["messages"][1]["content"]
+    assert "旧版原理" in user_prompt, "修订轮必须把上一版正文喂给模型"
+    assert "补充显存对比数据" in user_prompt
+    assert "统一术语对照" in user_prompt, "全局意见也要送达被重写的小节"
+    assert "在此基础上修订" in user_prompt
+    assert llm.calls[0]["temperature"] == 0.3, "修订是编辑任务，必须低温收敛"
+
+
+@pytest.mark.asyncio
+async def test_global_only_notes_trigger_full_rewrite_with_previous_draft():
+    """只有全局意见时全量重写，但每节都基于上一版修订而非盲写重抽。"""
+    state = _revision_state()
+    state.actionable_revisions = [{"section": "全局", "advice": "统一术语对照"}]
+    llm = ScriptedLLM([LLMResponse(content="新原理"), LLMResponse(content="新实践")])
+    agent = WriterAgent(llm, knowledge_base=FakeKnowledgeBase())
+
+    state = await agent.run(state)
+
+    assert len(llm.calls) == 2
+    assert state.section_drafts == {"一、原理": "新原理", "二、实践": "新实践"}
+    for call in llm.calls:
+        body = call["messages"][1]["content"]
+        assert "统一术语对照" in body
+        assert "在此基础上修订" in body
+        assert call["temperature"] == 0.3
+
+
+@pytest.mark.asyncio
+async def test_revision_empty_content_keeps_previous_version():
+    """定向重写拿到空正文时必须保留上一版，修订轮绝不丢内容。"""
+    state = _revision_state()
+    state.actionable_revisions = [{"section": "一、原理", "advice": "补充数据"}]
+    llm = ScriptedLLM([LLMResponse(content="   ", finish_reason="tool_calls")])
+    agent = WriterAgent(llm, knowledge_base=FakeKnowledgeBase())
+
+    state = await agent.run(state)
+
+    assert state.section_drafts == {"一、原理": "旧版原理", "二、实践": "旧版实践"}
+    assert any("保留上一版" in e for e in state.errors)
+
+
+@pytest.mark.asyncio
+async def test_initial_write_uses_high_temperature():
+    """初稿轮行为不变：全量撰写、temperature 0.7。"""
+    state = WritingState(topic="t", outline_title="标题")
+    state.sections = [SectionSpec(title="一、原理", target_words=100)]
+    llm = ScriptedLLM([LLMResponse(content="初稿正文")])
+    agent = WriterAgent(llm, knowledge_base=FakeKnowledgeBase())
+
+    state = await agent.run(state)
+
+    assert llm.calls[0]["temperature"] == 0.7
+    assert "旧版" not in llm.calls[0]["messages"][1]["content"]
+    assert state.section_drafts == {"一、原理": "初稿正文"}

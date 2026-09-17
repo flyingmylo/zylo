@@ -2,6 +2,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 
+# 审稿意见的全局作用域标记：不针对任何具体小节的意见统一归入该值
+GLOBAL_SCOPE = "全局"
+
+
 class Stage(str, Enum):
     INIT = "init"
     RESEARCHING = "researching"
@@ -46,7 +50,8 @@ class WritingState:
     review_passed: bool = False
     review_score: float = 0.0  # 0 - 100
     critiques: list[str] = field(default_factory=list)
-    actionable_revisions: list[str] = field(default_factory=list)
+    # 每条为 {"section": 小节标题或 GLOBAL_SCOPE, "advice": 修改建议}
+    actionable_revisions: list[dict[str, str]] = field(default_factory=list)
     revision_count: int = 0
     max_revisions: int = 2
 
