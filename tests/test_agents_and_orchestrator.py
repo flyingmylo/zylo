@@ -232,15 +232,19 @@ class FluctuatingReviewMock(LLMProvider):
 
         if "审稿专家" in system_msg:
             score = self.scores[min(self.review_round, len(self.scores) - 1)]
+            round_number = self.review_round + 1
             self.review_round += 1
             return LLMResponse(
                 content=json.dumps(
                     {
                         "passed": False,
                         "score": score,
-                        "critiques": ["技术深度不足。"],
+                        "critiques": [f"第{round_number}轮问题"],
                         "actionable_revisions": [
-                            {"section": "一、核心原理", "advice": "补充实测数据"}
+                            {
+                                "section": "一、核心原理",
+                                "advice": f"第{round_number}轮建议",
+                            }
                         ],
                     }
                 )
@@ -269,10 +273,14 @@ async def test_best_draft_is_restored_on_forced_finalize(tmp_path):
     assert mock.review_round == 3  # 初稿 + 2 轮修改全部审完，均未通过
     assert state.review_passed is False
     assert state.review_score == 78.5
+    assert state.critiques == ["第1轮问题"]
+    assert state.actionable_revisions[0]["advice"] == "第1轮建议"
+    assert state.selected_revision == 0
     assert "第1轮正文" in state.full_draft
     assert "第3轮正文" not in state.full_draft
     assert any("已回退保留初稿" in m for m in progress)
     assert "review_score: 78.5" in state.final_markdown
+    assert "最终采用版本**: `初稿`" in state.final_markdown
 
 
 @pytest.mark.asyncio
@@ -293,6 +301,7 @@ async def test_no_backfill_when_final_round_is_best(tmp_path):
     )
 
     assert state.review_score == 90.0
+    assert state.selected_revision == 2
     assert "第3轮正文" in state.full_draft
     assert not any("回退保留" in m for m in progress)
 

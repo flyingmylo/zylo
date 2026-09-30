@@ -1,6 +1,7 @@
 import os
 import re
 from collections.abc import Callable
+from copy import deepcopy
 from datetime import UTC, datetime
 
 from src.agents.planner import PlannerAgent
@@ -108,18 +109,27 @@ class WritingOrchestrator:
                     "score": state.review_score,
                     "section_drafts": dict(state.section_drafts),
                     "full_draft": state.full_draft,
+                    "review_passed": state.review_passed,
+                    "critiques": list(state.critiques),
+                    "actionable_revisions": deepcopy(state.actionable_revisions),
                 }
 
             if state.review_passed:
+                state.selected_revision = state.revision_count
                 self.on_progress("🎉 审稿通过，符合发布质量！", state)
                 break
 
-            state.revision_count += 1
-            if state.revision_count > state.max_revisions:
+            if state.revision_count >= state.max_revisions:
                 if best_snapshot["score"] > state.review_score:
                     state.review_score = best_snapshot["score"]
                     state.section_drafts = best_snapshot["section_drafts"]
                     state.full_draft = best_snapshot["full_draft"]
+                    state.review_passed = best_snapshot["review_passed"]
+                    state.critiques = best_snapshot["critiques"]
+                    state.actionable_revisions = best_snapshot[
+                        "actionable_revisions"
+                    ]
+                    state.selected_revision = best_snapshot["round"]
                     best_round_desc = (
                         "初稿"
                         if best_snapshot["round"] == 0
@@ -130,11 +140,15 @@ class WritingOrchestrator:
                         f"（{best_snapshot['score']:.1f} 分）...",
                         state,
                     )
+                else:
+                    state.selected_revision = state.revision_count
                 self.on_progress(
                     f"⚠️ 已达到最大修改轮次 ({state.max_revisions} 轮)，强制定稿。",
                     state,
                 )
                 break
+
+            state.revision_count += 1
 
             self.on_progress(
                 f"🔄 审稿未通过，存在 {len(state.actionable_revisions)} 处待改进项，进入下一轮迭代...",
@@ -164,6 +178,7 @@ total_words: {len(state.full_draft)}
 ### 审稿与生成元信息
 - **综合质检评分**: `{state.review_score:.1f} / 100`
 - **反思修订轮次**: `{state.revision_count}`
+- **最终采用版本**: `{'初稿' if state.selected_revision == 0 else f'第 {state.selected_revision} 轮修改稿'}`
 - **Token 消耗统计**: `Prompt: {state.token_usage.get("prompt_tokens", 0)} | Completion: {state.token_usage.get("completion_tokens", 0)} | Total: {state.token_usage.get("total_tokens", 0)}`
 """
         return header + state.full_draft + footer

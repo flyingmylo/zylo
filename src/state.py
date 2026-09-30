@@ -54,6 +54,7 @@ class WritingState:
     actionable_revisions: list[dict[str, str]] = field(default_factory=list)
     revision_count: int = 0
     max_revisions: int = 2
+    selected_revision: int = 0  # 最终导出采用的版本轮次，0 表示初稿
 
     # 终稿与日志
     final_markdown: str = ""

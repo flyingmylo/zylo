@@ -44,7 +44,10 @@ class WriterAgent(BaseAgent):
 
         # 2. 圈定本轮需要重写的小节：定向点名优先；
         #    只有全局意见（或没有意见）时全量重写，但同样基于上一版正文做修订
-        if is_revision and section_notes:
+        if is_revision and global_notes:
+            # 全局意见必须覆盖全文；即使同时存在局部意见，也不能只修改被点名小节。
+            targeted_titles = set(all_titles)
+        elif is_revision and section_notes:
             targeted_titles = set(section_notes)
             # 初稿轮被跳过的小节没有旧稿可复用，必须趁修订轮补写
             targeted_titles |= {

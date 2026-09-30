@@ -570,6 +570,41 @@ async def test_researcher_fulltext_fetch_is_capped(monkeypatch):
     assert len(kb.documents) == 10  # 10 条全部以摘要形式入库
 
 
+def test_researcher_summary_sampling_round_robins_across_sources():
+    """调研综述必须优先覆盖不同来源，而不是被首个网页的切片垄断。"""
+    chunks = [
+        {"text": "a1", "source": "a", "page": "1"},
+        {"text": "a2", "source": "a", "page": "1"},
+        {"text": "a3", "source": "a", "page": "1"},
+        {"text": "b1", "source": "b", "page": "1"},
+        {"text": "b2", "source": "b", "page": "1"},
+        {"text": "c1", "source": "c", "page": "1"},
+    ]
+
+    selected = ResearcherAgent._select_diverse_chunks(chunks, limit=5)
+
+    assert [chunk["text"] for chunk in selected] == ["a1", "b1", "c1", "a2", "b2"]
+
+
+@pytest.mark.asyncio
+async def test_researcher_fetch_exception_falls_back_to_snippet(monkeypatch):
+    async def raising_fetch(url, timeout=10.0):
+        raise RuntimeError("network failed")
+
+    monkeypatch.setattr(WebReader, "fetch_and_clean", raising_fetch)
+    agent = ResearcherAgent(
+        ScriptedLLM([]), knowledge_base=FakeKnowledgeBase(), search_tool=None
+    )
+    candidate = {
+        "url": "https://example.com",
+        "snippet": {"text": "摘要", "source": "https://example.com", "page": "1"},
+    }
+
+    result = await agent._fetch_one(candidate, __import__("asyncio").Semaphore(1))
+
+    assert result == [candidate["snippet"]]
+
+
 # --------------------------------------------------------------------------
 # Writer 空正文处理
 # --------------------------------------------------------------------------
@@ -641,6 +676,33 @@ async def test_reviewer_parses_structured_revisions():
     assert state.actionable_revisions == [
         {"section": "一、原理", "advice": "补充显存对比数据"},
         {"section": "全局", "advice": "统一术语双语对照"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reviewer_preserves_explicit_global_scope_when_advice_names_section():
+    """显式全局意见不能因为正文中提到某个小节标题而被错误降级为局部意见。"""
+    llm = ScriptedLLM(
+        [
+            LLMResponse(
+                content=_review_json(
+                    [
+                        {
+                            "section": "全局",
+                            "advice": "统一一、原理与二、实践之间的术语表达",
+                        }
+                    ]
+                )
+            )
+        ]
+    )
+    state = await ReviewerAgent(llm).run(_review_state(["一、原理", "二、实践"]))
+
+    assert state.actionable_revisions == [
+        {
+            "section": "全局",
+            "advice": "统一一、原理与二、实践之间的术语表达",
+        }
     ]
 
 
@@ -732,23 +794,30 @@ async def test_revision_round_rewrites_only_targeted_sections():
 
 
 @pytest.mark.asyncio
-async def test_revision_prompt_carries_previous_draft_notes_and_low_temperature():
+async def test_mixed_global_and_local_notes_rewrite_every_section():
+    """混合意见中只要存在全局项，就必须重写所有章节。"""
     state = _revision_state()
     state.actionable_revisions = [
         {"section": "一、原理", "advice": "补充显存对比数据"},
         {"section": "全局", "advice": "统一术语对照"},
     ]
-    llm = ScriptedLLM([LLMResponse(content="新版原理")])
+    llm = ScriptedLLM(
+        [LLMResponse(content="新版原理"), LLMResponse(content="新版实践")]
+    )
     agent = WriterAgent(llm, knowledge_base=FakeKnowledgeBase())
 
     await agent.run(state)
 
-    user_prompt = llm.calls[0]["messages"][1]["content"]
-    assert "旧版原理" in user_prompt, "修订轮必须把上一版正文喂给模型"
-    assert "补充显存对比数据" in user_prompt
-    assert "统一术语对照" in user_prompt, "全局意见也要送达被重写的小节"
-    assert "在此基础上修订" in user_prompt
-    assert llm.calls[0]["temperature"] == 0.3, "修订是编辑任务，必须低温收敛"
+    assert len(llm.calls) == 2
+    first_prompt = llm.calls[0]["messages"][1]["content"]
+    second_prompt = llm.calls[1]["messages"][1]["content"]
+    assert "旧版原理" in first_prompt
+    assert "补充显存对比数据" in first_prompt
+    assert "统一术语对照" in first_prompt
+    assert "旧版实践" in second_prompt
+    assert "补充显存对比数据" not in second_prompt
+    assert "统一术语对照" in second_prompt
+    assert all(call["temperature"] == 0.3 for call in llm.calls)
 
 
 @pytest.mark.asyncio

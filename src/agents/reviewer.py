@@ -86,8 +86,10 @@ class ReviewerAgent(BaseAgent):
         normalized: list[dict[str, str]] = []
         for rev in raw_revisions:
             if isinstance(rev, dict):
-                advice = str(rev.get("advice", "")).strip()
-                scope = str(rev.get("section", "")).strip()
+                raw_advice = rev.get("advice", "")
+                raw_scope = rev.get("section", "")
+                advice = raw_advice.strip() if isinstance(raw_advice, str) else ""
+                scope = raw_scope.strip() if isinstance(raw_scope, str) else ""
             elif isinstance(rev, str):
                 advice, scope = rev.strip(), ""
             else:
@@ -95,9 +97,15 @@ class ReviewerAgent(BaseAgent):
             if not advice:
                 continue
 
+            # 显式标记为全局时必须尊重其作用域，不能因为 advice 偶然包含
+            # 某个标题而把它重新归类成局部意见。
+            if scope == GLOBAL_SCOPE:
+                normalized.append({"section": GLOBAL_SCOPE, "advice": advice})
+                continue
+
             # 优先用声明的 section 定位；定位失败再尝试从建议文本中反查标题
             matched = self._match_title(scope, titles) or self._match_title(advice, titles)
-            if scope and scope != GLOBAL_SCOPE and not matched:
+            if scope and not matched:
                 self.logger.warning(
                     "审稿意见定位「%s」未能匹配任何小节标题，已归入全局", scope
                 )
