@@ -1,9 +1,12 @@
 import os
+import ipaddress
+
 import pytest
 import pymupdf
 from src.tools.pdf_reader import DocumentReader
 from src.tools.knowledge_base import KnowledgeBase
 from src.embeddings.base import EmbeddingProvider
+from src.tools.web_reader import WebReader
 
 
 class DummyEmbeddingProvider(EmbeddingProvider):
@@ -14,6 +17,29 @@ class DummyEmbeddingProvider(EmbeddingProvider):
 
     def embed_query(self, text: str) -> list[float]:
         return [0.1] * 8
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url",
+    [
+        "file:///etc/passwd",
+        "http://127.0.0.1/admin",
+        "http://[::1]/admin",
+        "http://169.254.169.254/latest/meta-data",
+        "http://10.0.0.1/internal",
+        "https://user:secret@example.com/",
+    ],
+)
+async def test_web_reader_rejects_unsafe_urls(url):
+    with pytest.raises(ValueError):
+        await WebReader.validate_public_url(url)
+
+
+@pytest.mark.asyncio
+async def test_web_reader_accepts_public_ip_url():
+    public_ip = str(ipaddress.ip_address("1.1.1.1"))
+    await WebReader.validate_public_url(f"https://{public_ip}/docs")
 
 
 def test_document_reader_text(tmp_path):
@@ -176,4 +202,3 @@ async def test_read_source_arxiv_download_and_cache(tmp_path, monkeypatch):
     assert len(chunks) == 1
     assert "DeepSeek-V3" in chunks[0]["text"]
     assert chunks[0]["source"] == "arxiv_2412.19437.pdf"
-
