@@ -132,6 +132,13 @@ async def _run_write_async(
         )
     )
 
+    if state.errors:
+        console.print(
+            f"[yellow]⚠ 任务完成，但有 {len(state.errors)} 条非致命错误：[/yellow]"
+        )
+        for err in state.errors:
+            console.print(f"  [dim]- {err}[/dim]")
+
 
 @app.command(
     name="write",
@@ -139,13 +146,13 @@ async def _run_write_async(
 )
 def write(
     inputs: Annotated[
-        Optional[list[str]],
+        list[str] | None,
         typer.Argument(
             help="文章主题；后续参数可直接跟本地文件（.pdf/.md/.txt）或论文 URL（如 arXiv 链接）",
         ),
     ] = None,
     topic: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "-t",
             "--topic",
@@ -153,7 +160,7 @@ def write(
         ),
     ] = None,
     files: Annotated[
-        Optional[list[str]],
+        list[str] | None,
         typer.Option(
             "-f",
             "--file",
@@ -169,7 +176,7 @@ def write(
         ),
     ] = "",
     model: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "-m",
             "--model",
@@ -177,21 +184,21 @@ def write(
         ),
     ] = None,
     base_url: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--base-url",
             help="LLM API Base URL（支持 DeepSeek, 通义千问, 智谱等兼容端点）",
         ),
     ] = None,
     api_key: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--api-key",
             help="LLM API Key（默认从环境变量 LLM_API_KEY 读取）",
         ),
     ] = None,
     rerank: Annotated[
-        Optional[bool],
+        bool | None,
         typer.Option(
             "--rerank/--no-rerank",
             help="是否启用 BAAI/bge-reranker-v2-m3 本地深度精排（默认: auto 智能条件激活）",
@@ -303,9 +310,7 @@ def check():
     table.add_row("LLM API Key", llm_status, _mask_key(config.api_key))
 
     # LLM Model & Endpoint
-    model_status = (
-        "[green]✓ 已配置[/green]" if config.model else "[red]✗ 未设置[/red]"
-    )
+    model_status = "[green]✓ 已配置[/green]" if config.model else "[red]✗ 未设置[/red]"
     table.add_row("LLM 模型", model_status, config.model or "未设置 (必须显式指定)")
 
     base_url_status = (

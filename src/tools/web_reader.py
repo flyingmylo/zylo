@@ -6,7 +6,6 @@ import urllib.parse
 import httpx
 from bs4 import BeautifulSoup
 
-
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_REDIRECTS = 5
 ALLOWED_CONTENT_TYPES = {
@@ -57,7 +56,9 @@ class WebReader:
         }
         try:
             current_url = url
-            async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+            async with httpx.AsyncClient(
+                timeout=timeout, follow_redirects=False
+            ) as client:
                 for redirect_count in range(MAX_REDIRECTS + 1):
                     # 每次跳转都重新校验，防止公开 URL 重定向到内网地址。
                     await WebReader.validate_public_url(current_url)

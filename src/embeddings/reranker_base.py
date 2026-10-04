@@ -10,4 +10,4 @@ class RerankerProvider(ABC):
         利用 Cross-Encoder 全注意力机制对候选文本重排打分
         返回最相关的 top_k 个文本
         """
-        pass
+        ...

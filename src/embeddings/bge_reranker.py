@@ -31,8 +31,13 @@ class BGERerankerProvider(RerankerProvider):
             self.model = CrossEncoder(
                 model_name, device=self.device, local_files_only=True
             )
-        except Exception:
-            logger.info("本地缓存未命中 %s，回退联网下载", model_name)
+        except Exception as exc:  # noqa:BLE001
+            logger.info(
+                "本地缓存加载失败（%s：%s），回退联网下载 %s",
+                type(exc).__name__,
+                exc,
+                model_name,
+            )
             self.model = CrossEncoder(model_name, device=self.device)
 
     def rerank(self, query: str, documents: list[str], top_k: int = 3) -> list[str]:

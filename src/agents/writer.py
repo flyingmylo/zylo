@@ -1,6 +1,6 @@
 from src.llm.base import LLMProvider
 from src.prompts import WRITER_SYSTEM_PROMPT
-from src.state import GLOBAL_SCOPE, Stage, WritingState
+from src.state import Stage, WritingState
 from src.tools.knowledge_base import KnowledgeBase
 
 from .base import BaseAgent
@@ -50,9 +50,7 @@ class WriterAgent(BaseAgent):
         elif is_revision and section_notes:
             targeted_titles = set(section_notes)
             # 初稿轮被跳过的小节没有旧稿可复用，必须趁修订轮补写
-            targeted_titles |= {
-                t for t in all_titles if t not in previous_drafts
-            }
+            targeted_titles |= {t for t in all_titles if t not in previous_drafts}
         else:
             targeted_titles = set(all_titles)
 

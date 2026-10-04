@@ -30,13 +30,19 @@ class BGEM3EmbeddingProvider(EmbeddingProvider):
     def __init__(self, model_name: str = "BAAI/bge-m3"):
         self.device = "mps" if torch.backends.mps.is_available() else "cpu"
         # 模型是固定公开权重，优先离线加载本地缓存：跳过对 Hub 的 etag 复检，
-        # 消除未认证请求警告并省去每次启动的联网往返；缓存缺失时回退联网下载
+        # 宽捕获是刻意的自愈设计：缓存缺失或缓存损坏可能表现为任意异常，
+        # 统一回退联网重新下载；真实病因记录在下方日志中
         try:
             self.model = SentenceTransformer(
                 model_name, device=self.device, local_files_only=True
             )
-        except Exception:
-            logger.info("本地缓存未命中 %s，回退联网下载", model_name)
+        except Exception as exc:    # noqa:BLE001
+            logger.info(
+                "本地缓存加载失败（%s：%s），回退联网下载 %s",
+                type(exc).__name__,
+                exc,
+                model_name,
+            )
             self.model = SentenceTransformer(model_name, device=self.device)
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:

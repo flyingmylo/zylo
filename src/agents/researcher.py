@@ -1,6 +1,7 @@
 import asyncio
 import json
 from collections import defaultdict
+from typing import TypedDict
 
 from src.llm.base import LLMProvider
 from src.prompts import RESEARCHER_SYSTEM_PROMPT
@@ -17,6 +18,11 @@ MAX_FULLTEXT_FETCH = 8
 FETCH_CONCURRENCY = 4
 # 清洗后正文低于该长度大概率是反爬空壳页，降级用搜索摘要
 MIN_FULLTEXT_CHARS = 400
+
+
+class FetchCandidate(TypedDict):
+    url: str
+    snippet: dict[str, str]
 
 
 class ResearcherAgent(BaseAgent):
@@ -57,7 +63,8 @@ class ResearcherAgent(BaseAgent):
                 chunks = await self.doc_reader.read_source(source)
                 all_chunks.extend(chunks)
             except Exception as e:
-                state.errors.append(f"读取参考资料失败 {source}: {str(e)}")
+                self.logger.exception("读取参考资料失败 %s", source)
+                state.errors.append(f"读取参考资料失败 {source}: {e}")
 
         # 2. 联网补充搜索（针对主题生成中英文搜索词）
         if self.search_tool:
@@ -77,10 +84,15 @@ class ResearcherAgent(BaseAgent):
                 elif content.startswith("```"):
                     content = content[3:].rsplit("```", 1)[0].strip()
                 queries = json.loads(content)
-            except Exception:
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning(
+                    "检索词 JSON 解析失败（%s：%s），回退使用原始主题作为检索词",
+                    type(exc).__name__,
+                    exc,
+                )
                 queries = [state.topic]
 
-            fetch_candidates: list[dict] = []
+            fetch_candidates: list[FetchCandidate] = []
             seen_urls: set[str] = set()
             for q in queries[:4]:
                 search_results = await self.search_tool.search(q, max_results=3)
@@ -161,7 +173,7 @@ class ResearcherAgent(BaseAgent):
         return selected
 
     async def _fetch_fulltext(
-        self, candidates: list[dict[str, str]]
+        self, candidates: list[FetchCandidate]
     ) -> list[dict[str, str]]:
         """并发抓取搜索结果原文切块入库。
 
@@ -170,7 +182,10 @@ class ResearcherAgent(BaseAgent):
         """
         if not candidates:
             return []
-        to_fetch, rest = candidates[:MAX_FULLTEXT_FETCH], candidates[MAX_FULLTEXT_FETCH:]
+        to_fetch, rest = (
+            candidates[:MAX_FULLTEXT_FETCH],
+            candidates[MAX_FULLTEXT_FETCH:],
+        )
         sem = asyncio.Semaphore(FETCH_CONCURRENCY)
         batches = await asyncio.gather(*(self._fetch_one(c, sem) for c in to_fetch))
         chunks = [chunk for batch in batches for chunk in batch]
@@ -178,7 +193,7 @@ class ResearcherAgent(BaseAgent):
         return chunks
 
     async def _fetch_one(
-        self, candidate: dict[str, str], sem: asyncio.Semaphore
+        self, candidate: FetchCandidate, sem: asyncio.Semaphore
     ) -> list[dict[str, str]]:
         url = candidate["url"]
         try:
