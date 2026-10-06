@@ -1,7 +1,8 @@
 import asyncio
 import ipaddress
 import socket
-import urllib.parse
+from typing import cast
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -20,7 +21,7 @@ class WebReader:
     @staticmethod
     async def validate_public_url(url: str) -> None:
         """只允许解析到公网地址的 HTTP(S) URL；不安全时抛 ValueError。"""
-        parsed = urllib.parse.urlparse(url)
+        parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise ValueError("仅支持带主机名的 HTTP/HTTPS URL")
         if parsed.username or parsed.password:
@@ -39,7 +40,8 @@ class WebReader:
                 type=socket.SOCK_STREAM,
             )
             addresses = {
-                ipaddress.ip_address(info[4][0].split("%", 1)[0]) for info in infos
+                ipaddress.ip_address(cast(str, info[4][0]).split("%", 1)[0])
+                for info in infos
             }
 
         if not addresses or any(not address.is_global for address in addresses):
@@ -71,7 +73,7 @@ class WebReader:
                             location = res.headers.get("location")
                             if not location:
                                 return ""
-                            current_url = urllib.parse.urljoin(current_url, location)
+                            current_url = urljoin(current_url, location)
                             continue
 
                         if res.status_code != 200:
@@ -126,7 +128,13 @@ class WebReader:
                             line.strip() for line in text.splitlines() if line.strip()
                         ]
                         return "\n".join(lines)
-        except Exception:
+        except (
+            ValueError,
+            LookupError,
+            OSError,
+            httpx.HTTPError,
+            httpx.InvalidURL,
+        ):
             return ""
 
         return ""

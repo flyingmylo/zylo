@@ -48,7 +48,7 @@ class PlannerAgent(BaseAgent):
 
         try:
             data = json.loads(raw)
-        except Exception:
+        except json.JSONDecodeError:
             # 正则容错提取第一个 json object
             match = re.search(r"\{.*\}", raw, re.DOTALL)
             if match:

@@ -1,10 +1,12 @@
 import os
 import ipaddress
+import socket
 
+import httpx
 import pytest
 import pymupdf
 from src.tools.pdf_reader import DocumentReader
-from src.tools.knowledge_base import KnowledgeBase
+from src.tools.knowledge_base import ChromaEmbeddingAdapter, KnowledgeBase
 from src.embeddings.base import EmbeddingProvider
 from src.tools.web_reader import WebReader
 
@@ -202,3 +204,144 @@ async def test_read_source_arxiv_download_and_cache(tmp_path, monkeypatch):
     assert len(chunks) == 1
     assert "DeepSeek-V3" in chunks[0]["text"]
     assert chunks[0]["source"] == "arxiv_2412.19437.pdf"
+
+
+def test_chroma_embedding_adapter_unbound_raises_runtime_error():
+    """未绑定 provider 的适配器必须响亮失败（契约翻转：静默空向量 → RuntimeError）。"""
+    adapter = ChromaEmbeddingAdapter()
+    with pytest.raises(RuntimeError, match="未绑定"):
+        adapter(["某段文本"])
+
+    # build_from_config 仍会产出未绑定实例：一旦被 chromadb 按配置重建，必须抛错而非静默空检索
+    rebuilt = ChromaEmbeddingAdapter.build_from_config({})
+    assert rebuilt.provider is None
+    with pytest.raises(RuntimeError):
+        rebuilt(["x"])
+
+    bound = ChromaEmbeddingAdapter(DummyEmbeddingProvider())
+    vectors = bound(["x"])
+    assert len(vectors) == 1
+    assert list(vectors[0]) == [0.1] * 8
+
+
+@pytest.mark.asyncio
+async def test_fetch_and_clean_swallows_socket_errors(monkeypatch):
+    """DNS/socket 层故障（gaierror ⊂ OSError）应被吞掉返回空串，而非向上传播。"""
+
+    async def raise_gaierror(url):
+        raise socket.gaierror(8, "nodename nor servname provided")
+
+    monkeypatch.setattr(WebReader, "validate_public_url", raise_gaierror)
+    assert await WebReader.fetch_and_clean("https://dead-domain.invalid/") == ""
+
+
+@pytest.mark.asyncio
+async def test_fetch_and_clean_failure_paths_return_empty_string(monkeypatch):
+    """httpx 层错误、重定向超额、SSRF 重定向、非文本响应都应返回空串。"""
+
+    class _StubStream:
+        def __init__(self, resp):
+            self._resp = resp
+
+        async def __aenter__(self):
+            return self._resp
+
+        async def __aexit__(self, *args):
+            return False
+
+    class _StubClient:
+        def __init__(self, resp):
+            self._resp = resp
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, *args, **kwargs):
+            return _StubStream(self._resp)
+
+    class _StubResponse:
+        def __init__(self, redirect_to=None, status_code=200, content_type="text/html"):
+            self.status_code = status_code
+            self.headers = {"content-type": content_type}
+            if redirect_to is not None:
+                self.headers["location"] = redirect_to
+            self._redirect_to = redirect_to
+
+        @property
+        def is_redirect(self):
+            return self._redirect_to is not None
+
+        async def aiter_bytes(self):
+            yield b"<html><body>ok</body></html>"
+
+    # 1) 连接层错误（httpx.ConnectError ⊂ HTTPError）
+    class _ExplodingClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            raise httpx.ConnectError("连接失败")
+
+        async def __aexit__(self, *args):
+            return False
+
+    monkeypatch.setattr("httpx.AsyncClient", _ExplodingClient)
+    assert await WebReader.fetch_and_clean("https://1.1.1.1/docs") == ""
+
+    # 2) 重定向超额（location 指向自身，超过 MAX_REDIRECTS 后放弃）
+    loop_resp = _StubResponse(redirect_to="https://1.1.1.1/loop")
+    monkeypatch.setattr("httpx.AsyncClient", lambda *a, **kw: _StubClient(loop_resp))
+    assert await WebReader.fetch_and_clean("https://1.1.1.1/loop") == ""
+
+    # 3) 重定向到内网地址（SSRF 校验抛 ValueError，应被吞掉返回空串）
+    ssrf_resp = _StubResponse(redirect_to="http://127.0.0.1/admin")
+    monkeypatch.setattr("httpx.AsyncClient", lambda *a, **kw: _StubClient(ssrf_resp))
+    assert await WebReader.fetch_and_clean("https://1.1.1.1/redirect") == ""
+
+    # 4) 非文本 content-type
+    binary_resp = _StubResponse(
+        status_code=200, content_type="application/octet-stream"
+    )
+    monkeypatch.setattr("httpx.AsyncClient", lambda *a, **kw: _StubClient(binary_resp))
+    assert await WebReader.fetch_and_clean("https://1.1.1.1/file") == ""
+
+
+@pytest.mark.asyncio
+async def test_read_url_corrupted_pdf_cache_falls_back_to_web(tmp_path, monkeypatch):
+    """缓存 PDF 损坏（下载中断残留）时应回退网页抓取，FileDataError 不得逃逸。"""
+    cache_dir = tmp_path / "references"
+    reader = DocumentReader(chunk_size=100, cache_dir=str(cache_dir))
+
+    class _Resp:
+        status_code = 200
+        headers = {"content-type": "application/pdf"}
+        content = b"%PDF-1.4 truncated broken content"  # 带 PDF 头但内容损坏
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, headers=None):
+            return _Resp()
+
+    monkeypatch.setattr("httpx.AsyncClient", _Client)
+
+    async def fake_fetch(u):
+        return "网页正文：FlashAttention 的核心思想是避免物化完整注意力矩阵。"
+
+    monkeypatch.setattr(WebReader, "fetch_and_clean", fake_fetch)
+
+    chunks = await reader.read_source("https://example.org/paper.pdf")
+
+    assert len(chunks) == 1
+    assert "FlashAttention" in chunks[0]["text"]
+    assert chunks[0]["source"] == "https://example.org/paper.pdf"

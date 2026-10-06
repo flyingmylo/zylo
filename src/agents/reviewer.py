@@ -50,7 +50,7 @@ class ReviewerAgent(BaseAgent):
 
         try:
             data = json.loads(raw)
-        except Exception:
+        except json.JSONDecodeError:
             match = re.search(r"\{.*\}", raw, re.DOTALL)
             if match:
                 data = json.loads(match.group(0))
@@ -104,7 +104,9 @@ class ReviewerAgent(BaseAgent):
                 continue
 
             # 优先用声明的 section 定位；定位失败再尝试从建议文本中反查标题
-            matched = self._match_title(scope, titles) or self._match_title(advice, titles)
+            matched = self._match_title(scope, titles) or self._match_title(
+                advice, titles
+            )
             if scope and not matched:
                 self.logger.warning(
                     "审稿意见定位「%s」未能匹配任何小节标题，已归入全局", scope

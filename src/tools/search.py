@@ -1,5 +1,5 @@
 import os
-from typing import Any
+from typing import Any, Literal
 
 from tavily import TavilyClient
 
@@ -53,7 +53,10 @@ class SearchTool:
         return await self.search(query=query, search_depth=depth)
 
     async def search(
-        self, query: str, search_depth: str = "basic", max_results: int = 5
+        self,
+        query: str,
+        search_depth: Literal["basic", "advanced", "fast", "ultra-fast"] = "basic",
+        max_results: int = 5,
     ) -> list[dict[str, Any]]:
         """执行搜索并返回 [{title, url, content}, ...]"""
         if not self.client:
@@ -79,11 +82,11 @@ class SearchTool:
                     }
                 )
             return results
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- 工具层容错：任何失败都转成错误消息返回给 LLM
             return [
                 {
                     "title": "Search Error",
                     "url": "",
-                    "content": f"搜索执行出错: {str(e)}",
+                    "content": f"搜索执行出错: {e!s}",
                 }
             ]

@@ -1,35 +1,49 @@
 import uuid
-from typing import Any
+from collections.abc import Sequence
+from typing import cast
 
 import chromadb
 from chromadb import EmbeddingFunction
-from chromadb.api.types import Documents, Embeddings
+from chromadb.api import ClientAPI
+from chromadb.api.types import Documents, Embeddable, Embeddings, Metadata
+from typing_extensions import override
 
 from src.embeddings.base import EmbeddingProvider
 from src.embeddings.reranker_base import RerankerProvider
 
 
-class ChromaEmbeddingAdapter(EmbeddingFunction):
+class ChromaEmbeddingAdapter(EmbeddingFunction[Documents]):
     """把项目通用的 EmbeddingProvider 包装为 ChromaDB 原生兼容的 EmbeddingFunction"""
 
-    def __init__(self, provider: EmbeddingProvider | None = None):
+    provider: EmbeddingProvider | None
+
+    def __init__(self, provider: EmbeddingProvider | None = None) -> None:
+        # 有意不调用 super().__init__()：基类 Protocol 的 __init__ 会发出 DeprecationWarning
         self.provider = provider
 
+    @override
     def __call__(self, input: Documents) -> Embeddings:
         if not self.provider:
-            return []
-        return self.provider.embed_documents(list(input))
+            raise RuntimeError(
+                "ChromaEmbeddingAdapter 未绑定 EmbeddingProvider；"
+                "当前设计（进程内一次性知识库）下此分支不应被触达，"
+                "若出现说明适配器被 build_from_config 异常重建"
+            )
+        return cast(Embeddings, self.provider.embed_documents(list(input)))
 
-    @classmethod
-    def name(cls) -> str:
+    @override
+    @staticmethod
+    def name() -> str:
         return "zylo_custom_embedding"
 
-    def get_config(self) -> dict[str, Any]:
+    @override
+    def get_config(self) -> dict[str, object]:
         return {"name": self.name()}
 
-    @classmethod
-    def build_from_config(cls, config: dict[str, Any]) -> "ChromaEmbeddingAdapter":
-        return cls(provider=None)
+    @override
+    @staticmethod
+    def build_from_config(config: dict[str, object]) -> "ChromaEmbeddingAdapter":
+        return ChromaEmbeddingAdapter(provider=None)
 
 
 class KnowledgeBase:
@@ -46,10 +60,10 @@ class KnowledgeBase:
         embedding_provider: EmbeddingProvider | None = None,
         reranker_provider: RerankerProvider | None = None,
     ):
-        self.collection_name = collection_name or f"writing_{uuid.uuid4().hex[:8]}"
-        self.client = chromadb.Client()
-        self.embedding_provider = embedding_provider
-        self.reranker = reranker_provider
+        self.collection_name: str = collection_name or f"writing_{uuid.uuid4().hex[:8]}"
+        self.client: ClientAPI = chromadb.Client()
+        self.embedding_provider: EmbeddingProvider | None = embedding_provider
+        self.reranker: RerankerProvider | None = reranker_provider
 
         embed_fn = (
             ChromaEmbeddingAdapter(self.embedding_provider)
@@ -57,9 +71,11 @@ class KnowledgeBase:
             else None
         )
 
-        self.collection = self.client.get_or_create_collection(
+        self.collection: chromadb.Collection = self.client.get_or_create_collection(
             name=self.collection_name,
-            embedding_function=embed_fn,
+            # chromadb 参数声明为逆变的 EmbeddingFunction[Embeddable]，而适配器按官方
+            # DefaultEmbeddingFunction 模式实现为 EmbeddingFunction[Documents]，需显式桥接
+            embedding_function=cast("EmbeddingFunction[Embeddable] | None", embed_fn),
             metadata={"hnsw:space": "cosine"},
         )
 
@@ -72,7 +88,7 @@ class KnowledgeBase:
             return
 
         texts = [d["text"] for d in documents]
-        metadatas = [
+        metadatas: list[Metadata] = [
             {"source": d.get("source", "unknown"), "page": str(d.get("page", "1"))}
             for d in documents
         ]
@@ -95,7 +111,7 @@ class KnowledgeBase:
         query_en: str = "",
         top_k: int = 4,
         candidate_pool: int = 6,
-    ) -> list[dict[str, Any]]:
+    ) -> list[dict[str, str]]:
         """
         双语 Query 扩展检索 + 可选 Reranker 过滤
         返回 [{"text": "...", "source": "...", "page": "..."}, ...]
@@ -105,7 +121,12 @@ class KnowledgeBase:
             return []
 
         n_fetch = min(candidate_pool, total_count)
-        candidates_map: dict[str, dict[str, Any]] = {}
+        candidates_map: dict[str, dict[str, str]] = {}
+
+        # 中英两个查询分支共用的局部变量：整个函数作用域内只声明一次，
+        # 避免同名重复显式标注触发 Pyright reportRedeclaration
+        metas: Sequence[Metadata]
+        meta_dict: Metadata
 
         # 1. 中文 Query 检索
         if query_zh.strip():
@@ -113,19 +134,20 @@ class KnowledgeBase:
                 query_texts=[query_zh.strip()],
                 n_results=n_fetch,
             )
-            if res_zh and res_zh.get("documents") and res_zh["documents"][0]:
-                docs = res_zh["documents"][0]
-                metas = (
-                    res_zh["metadatas"][0]
-                    if res_zh.get("metadatas") and res_zh["metadatas"][0]
-                    else [{}] * len(docs)
-                )
+            docs_batch = res_zh.get("documents")
+            if docs_batch and docs_batch[0]:
+                docs = docs_batch[0]
+                metas_batch = res_zh.get("metadatas")
+                if metas_batch and metas_batch[0]:
+                    metas = metas_batch[0]
+                else:
+                    metas = [{} for _ in docs]
                 for doc, meta in zip(docs, metas):
                     meta_dict = meta if isinstance(meta, dict) else {}
                     candidates_map[doc] = {
                         "text": doc,
-                        "source": meta_dict.get("source", ""),
-                        "page": meta_dict.get("page", "1"),
+                        "source": str(meta_dict.get("source", "")),
+                        "page": str(meta_dict.get("page", "1")),
                     }
 
         # 2. 英文 Query 检索（同语言搜英文文献，彻底避免相似度折扣）
@@ -134,20 +156,21 @@ class KnowledgeBase:
                 query_texts=[query_en.strip()],
                 n_results=n_fetch,
             )
-            if res_en and res_en.get("documents") and res_en["documents"][0]:
-                docs = res_en["documents"][0]
-                metas = (
-                    res_en["metadatas"][0]
-                    if res_en.get("metadatas") and res_en["metadatas"][0]
-                    else [{}] * len(docs)
-                )
+            docs_batch = res_en.get("documents")
+            if docs_batch and docs_batch[0]:
+                docs = docs_batch[0]
+                metas_batch = res_en.get("metadatas")
+                if metas_batch and metas_batch[0]:
+                    metas = metas_batch[0]
+                else:
+                    metas = [{} for _ in docs]
                 for doc, meta in zip(docs, metas):
                     if doc not in candidates_map:
                         meta_dict = meta if isinstance(meta, dict) else {}
                         candidates_map[doc] = {
                             "text": doc,
-                            "source": meta_dict.get("source", ""),
-                            "page": meta_dict.get("page", "1"),
+                            "source": str(meta_dict.get("source", "")),
+                            "page": str(meta_dict.get("page", "1")),
                         }
 
         candidate_list = list(candidates_map.values())

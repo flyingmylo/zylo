@@ -1,7 +1,10 @@
+import asyncio
 import hashlib
 import os
 import re
 import urllib.parse
+from pathlib import Path
+from typing import cast
 
 import httpx
 import pymupdf
@@ -100,7 +103,7 @@ class DocumentReader:
             return await self._read_arxiv(arxiv_id, original_source=source)
 
         # 3. 其它 HTTP/HTTPS 网络链接
-        if source.startswith("http://") or source.startswith("https://"):
+        if source.startswith(("http://", "https://")):
             return await self._read_url(source)
 
         # 4. 兜底尝试按本地路径读取
@@ -164,14 +167,15 @@ class DocumentReader:
                         "application/pdf" in content_type
                         or res.content.startswith(b"%PDF")
                     ):
-                        with open(cache_path, "wb") as f:
-                            f.write(res.content)
+                        await asyncio.to_thread(
+                            Path(cache_path).write_bytes, res.content
+                        )
                         console.print(
                             f"[bold green]✓[/bold green] 已下载论文并持久化缓存至: [cyan]{cache_path}[/cyan]"
                         )
                         download_success = True
                         break
-            except Exception:
+            except (httpx.HTTPError, httpx.InvalidURL, OSError):
                 continue
 
         if download_success:
@@ -179,7 +183,7 @@ class DocumentReader:
 
         # 降级尝试拉取摘要页
         console.print(
-            f"[yellow]! arXiv PDF 下载未成功，尝试回退抓取 Abstract 网页内容...[/yellow]"
+            "[yellow]! arXiv PDF 下载未成功，尝试回退抓取 Abstract 网页内容...[/yellow]"
         )
         abs_url = f"https://arxiv.org/abs/{arxiv_id}"
         text = await WebReader.fetch_and_clean(abs_url)
@@ -215,8 +219,7 @@ class DocumentReader:
                     or res.content.startswith(b"%PDF")
                     or url.lower().endswith(".pdf")
                 ):
-                    with open(cache_path, "wb") as f:
-                        f.write(res.content)
+                    await asyncio.to_thread(Path(cache_path).write_bytes, res.content)
                     console.print(
                         f"[bold green]✓[/bold green] 已下载文件并持久化缓存至: [cyan]{cache_path}[/cyan]"
                     )
@@ -226,7 +229,12 @@ class DocumentReader:
             text = await WebReader.fetch_and_clean(url)
             if text:
                 return self.chunk_text(text, source=url)
-        except Exception:
+        except (
+            httpx.HTTPError,
+            httpx.InvalidURL,
+            OSError,
+            pymupdf.FileDataError,
+        ):
             text = await WebReader.fetch_and_clean(url)
             if text:
                 return self.chunk_text(text, source=url)
@@ -238,7 +246,7 @@ class DocumentReader:
         chunks = []
         for page_num in range(len(doc)):
             page = doc[page_num]
-            text = page.get_text("text").strip()
+            text = cast(str, page.get_text("text")).strip()
             if not text:
                 continue
 
