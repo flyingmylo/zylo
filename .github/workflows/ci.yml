@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 用 uv 加速 torch/chromadb 等重依赖的安装；缓存按依赖文件摘要命中
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: 安装项目与依赖
+        run: |
+          uv venv
+          uv pip install -e .
+
+      - name: 单元测试
+        run: uv run pytest tests/ -q
+
+      - name: Lint（ruff）
+        run: uvx ruff check src tests
+
+      - name: 类型检查（pyright）
+        run: uvx pyright --project .
