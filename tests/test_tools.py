@@ -1,13 +1,13 @@
-import os
 import ipaddress
 import socket
 
 import httpx
-import pytest
 import pymupdf
-from src.tools.pdf_reader import DocumentReader
-from src.tools.knowledge_base import ChromaEmbeddingAdapter, KnowledgeBase
+import pytest
+
 from src.embeddings.base import EmbeddingProvider
+from src.tools.knowledge_base import ChromaEmbeddingAdapter, KnowledgeBase
+from src.tools.pdf_reader import DocumentReader
 from src.tools.web_reader import WebReader
 
 
@@ -19,6 +19,45 @@ class DummyEmbeddingProvider(EmbeddingProvider):
 
     def embed_query(self, text: str) -> list[float]:
         return [0.1] * 8
+
+
+def _noop_url_validator():
+    """绕过真实 DNS 解析的 SSRF 校验桩（测试环境无网络时必需）。"""
+
+    async def _validate(url: str) -> None:
+        return None
+
+    return _validate
+
+
+def _make_stream_stub(headers: dict, body: bytes, location: str | None = None):
+    """构造可挂到 httpx.AsyncClient.stream 的桩：返回固定响应（或重定向）。"""
+
+    class _Resp:
+        def __init__(self):
+            self.status_code = 302 if location else 200
+            self.headers = dict(headers)
+            if location:
+                self.headers["location"] = location
+
+        @property
+        def is_redirect(self):
+            return location is not None
+
+        async def aiter_bytes(self):
+            yield body
+
+    class _CM:
+        async def __aenter__(self):
+            return _Resp()
+
+        async def __aexit__(self, *args):
+            return False
+
+    def _stub(self, method, url, **kwargs):
+        return _CM()
+
+    return _stub
 
 
 @pytest.mark.asyncio
@@ -172,25 +211,14 @@ async def test_read_source_arxiv_download_and_cache(tmp_path, monkeypatch):
     pdf_bytes = doc.tobytes()
     doc.close()
 
-    class MockResponse:
-        status_code = 200
-        headers = {"content-type": "application/pdf"}
-        content = pdf_bytes
-
-    class MockAsyncClient:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            pass
-
-        async def get(self, url, headers=None):
-            return MockResponse()
-
-    monkeypatch.setattr("httpx.AsyncClient", MockAsyncClient)
+    monkeypatch.setattr(
+        WebReader, "validate_public_url", _noop_url_validator()
+    )
+    monkeypatch.setattr(
+        httpx.AsyncClient,
+        "stream",
+        _make_stream_stub({"content-type": "application/pdf"}, pdf_bytes),
+    )
 
     # 执行读取 (传入纯 ID)
     chunks = await reader.read_source("2412.19437")
@@ -315,25 +343,17 @@ async def test_read_url_corrupted_pdf_cache_falls_back_to_web(tmp_path, monkeypa
     cache_dir = tmp_path / "references"
     reader = DocumentReader(chunk_size=100, cache_dir=str(cache_dir))
 
-    class _Resp:
-        status_code = 200
-        headers = {"content-type": "application/pdf"}
-        content = b"%PDF-1.4 truncated broken content"  # 带 PDF 头但内容损坏
-
-    class _Client:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return False
-
-        async def get(self, url, headers=None):
-            return _Resp()
-
-    monkeypatch.setattr("httpx.AsyncClient", _Client)
+    monkeypatch.setattr(
+        WebReader, "validate_public_url", _noop_url_validator()
+    )
+    monkeypatch.setattr(
+        httpx.AsyncClient,
+        "stream",
+        _make_stream_stub(
+            {"content-type": "application/pdf"},
+            b"%PDF-1.4 truncated broken content",  # 带 PDF 头但内容损坏
+        ),
+    )
 
     async def fake_fetch(u):
         return "网页正文：FlashAttention 的核心思想是避免物化完整注意力矩阵。"
@@ -345,3 +365,116 @@ async def test_read_url_corrupted_pdf_cache_falls_back_to_web(tmp_path, monkeypa
     assert len(chunks) == 1
     assert "FlashAttention" in chunks[0]["text"]
     assert chunks[0]["source"] == "https://example.org/paper.pdf"
+    # 损坏缓存必须被清理，否则下次运行会在缓存命中分支反复崩溃
+    expected_cache = cache_dir / "example_org_paper_pdf.pdf"
+    assert not expected_cache.exists()
+
+
+def test_cache_path_includes_host_path_and_query(tmp_path):
+    """不同域名/路径/query 的 URL 不得互撞缓存文件名（会静默读到错误文献）。"""
+    reader = DocumentReader(cache_dir=str(tmp_path))
+
+    base = reader._get_cache_path("https://a.com/papers/flash.pdf")
+    other_host = reader._get_cache_path("https://b.com/papers/flash.pdf")
+    other_query = reader._get_cache_path("https://a.com/papers/flash.pdf?v=2")
+    other_path = reader._get_cache_path("https://a.com/other/flash.pdf")
+
+    assert len({base, other_host, other_query, other_path}) == 4
+
+
+@pytest.mark.asyncio
+async def test_corrupted_disk_cache_is_purged_and_refetched(tmp_path, monkeypatch):
+    """二次运行命中损坏缓存：必须删除坏文件并重新下载，而非反复崩溃。"""
+    cache_dir = tmp_path / "refs"
+    cache_dir.mkdir()
+    reader = DocumentReader(chunk_size=100, cache_dir=str(cache_dir))
+
+    doc = pymupdf.open()
+    p = doc.new_page()
+    p.insert_text((50, 72), "Refetched good PDF")
+    good_bytes = doc.tobytes()
+    doc.close()
+
+    # 模拟上次运行残留的损坏缓存
+    (cache_dir / "example_org_paper_pdf.pdf").write_bytes(b"%PDF-1.1 broken leftover")
+
+    monkeypatch.setattr(WebReader, "validate_public_url", _noop_url_validator())
+    monkeypatch.setattr(
+        httpx.AsyncClient,
+        "stream",
+        _make_stream_stub({"content-type": "application/pdf"}, good_bytes),
+    )
+
+    chunks = await reader.read_source("https://example.org/paper.pdf")
+
+    assert any("Refetched good PDF" in c["text"] for c in chunks)
+    # 坏缓存已被重新下载的好版本覆盖
+    assert (cache_dir / "example_org_paper_pdf.pdf").read_bytes() == good_bytes
+
+
+@pytest.mark.asyncio
+async def test_download_pdf_rejects_private_address(tmp_path):
+    """下载路径与 WebReader 同标准：内网地址直接拒绝，不发请求不落盘。"""
+    reader = DocumentReader(cache_dir=str(tmp_path))
+    target = tmp_path / "leaked.pdf"
+
+    ok = await reader._download_pdf("http://127.0.0.1:8080/secret.pdf", str(target))
+
+    assert ok is False
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_download_pdf_rejects_redirect_to_private_network(tmp_path, monkeypatch):
+    """重定向落入内网：逐跳 SSRF 校验必须放弃下载。"""
+    monkeypatch.setattr(WebReader, "validate_public_url", _noop_url_validator())
+    monkeypatch.setattr(
+        httpx.AsyncClient,
+        "stream",
+        _make_stream_stub({}, b"", location="http://10.0.0.5/inner.pdf"),
+    )
+    reader = DocumentReader(cache_dir=str(tmp_path))
+    target = tmp_path / "leaked.pdf"
+
+    ok = await reader._download_pdf("https://evil.example/paper.pdf", str(target))
+
+    assert ok is False
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_download_pdf_enforces_size_cap(tmp_path, monkeypatch):
+    """超过大小上限的响应立即放弃，不落盘半成品。"""
+    monkeypatch.setattr(WebReader, "validate_public_url", _noop_url_validator())
+    monkeypatch.setattr(
+        httpx.AsyncClient,
+        "stream",
+        _make_stream_stub({"content-type": "application/pdf"}, b"%PDF-" + b"x" * 100),
+    )
+    reader = DocumentReader(cache_dir=str(tmp_path))
+    target = tmp_path / "big.pdf"
+
+    ok = await reader._download_pdf(
+        "https://example.org/big.pdf", str(target), max_bytes=10
+    )
+
+    assert ok is False
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_download_pdf_rejects_fake_pdf_body(tmp_path, monkeypatch):
+    """URL 以 .pdf 结尾但响应是 HTML：魔术字节校验必须拒绝落盘。"""
+    monkeypatch.setattr(WebReader, "validate_public_url", _noop_url_validator())
+    monkeypatch.setattr(
+        httpx.AsyncClient,
+        "stream",
+        _make_stream_stub({"content-type": "application/pdf"}, b"<html>not a pdf</html>"),
+    )
+    reader = DocumentReader(cache_dir=str(tmp_path))
+    target = tmp_path / "fake.pdf"
+
+    ok = await reader._download_pdf("https://example.org/fake.pdf", str(target))
+
+    assert ok is False
+    assert not target.exists()

@@ -1,9 +1,8 @@
 from src.llm.base import LLMProvider
 from src.prompts import WRITER_SYSTEM_PROMPT
 from src.state import Stage, WritingState
-from src.tools.knowledge_base import KnowledgeBase
 
-from .base import BaseAgent
+from .base import AgentKnowledgeBase, BaseAgent
 
 
 class WriterAgent(BaseAgent):
@@ -15,7 +14,7 @@ class WriterAgent(BaseAgent):
     4. 修订轮在上一版正文基础上定向重写被点名的小节，未点名小节原样保留
     """
 
-    def __init__(self, llm: LLMProvider, knowledge_base: KnowledgeBase):
+    def __init__(self, llm: LLMProvider, knowledge_base: AgentKnowledgeBase):
         super().__init__(name="Writer", llm=llm, system_prompt=WRITER_SYSTEM_PROMPT)
         self.kb = knowledge_base
 

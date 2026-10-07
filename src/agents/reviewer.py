@@ -1,6 +1,3 @@
-import json
-import re
-
 from src.llm.base import LLMProvider
 from src.prompts import REVIEWER_SYSTEM_PROMPT
 from src.state import GLOBAL_SCOPE, Stage, WritingState
@@ -43,27 +40,24 @@ class ReviewerAgent(BaseAgent):
         )
 
         raw = resp.content.strip()
-        if raw.startswith("```json"):
-            raw = raw[7:].rsplit("```", 1)[0].strip()
-        elif raw.startswith("```"):
-            raw = raw[3:].rsplit("```", 1)[0].strip()
+        data = self._parse_llm_json(raw)
+        if not isinstance(data, dict):
+            # 两级解析都失败时的保底判定：默认通过并定稿，保证写作流程能收敛
+            data = {
+                "passed": True,
+                "score": 85.0,
+                "critiques": ["无法解析审稿人详细 JSON，默认通过并定稿。"],
+                "actionable_revisions": [],
+            }
 
         try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", raw, re.DOTALL)
-            if match:
-                data = json.loads(match.group(0))
-            else:
-                data = {
-                    "passed": True,
-                    "score": 85.0,
-                    "critiques": ["无法解析审稿人详细 JSON，默认通过并定稿。"],
-                    "actionable_revisions": [],
-                }
-
-        state.review_score = float(data.get("score", 85.0))
-        state.review_passed = bool(data.get("passed", state.review_score >= 85.0))
+            state.review_score = float(data.get("score", 85.0))
+        except (TypeError, ValueError):
+            # score 偶发为非数值（如 "八十八"）：回退默认分，不让畸形字段打断审稿
+            state.review_score = 85.0
+        state.review_passed = self._coerce_bool(
+            data.get("passed"), default=state.review_score >= 85.0
+        )
         state.critiques = data.get("critiques", [])
         raw_revisions = data.get("actionable_revisions", [])
         if not isinstance(raw_revisions, list):
@@ -73,6 +67,26 @@ class ReviewerAgent(BaseAgent):
         )
 
         return state
+
+    @staticmethod
+    def _coerce_bool(value: object, default: bool = False) -> bool:
+        """把模型输出的宽松布尔值规范为真正的 bool。
+
+        模型偶发输出 "false"/"0" 等字符串，而 bool("false") 为 True，
+        曾导致低分稿被误判通过（fail-open）。无法识别的值回退 default，
+        由调用方决定缺省语义。
+        """
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in ("true", "1", "yes", "on"):
+                return True
+            if lowered in ("false", "0", "no", "off"):
+                return False
+        return default
 
     def _normalize_revisions(
         self, raw_revisions: list, section_titles: list[str]

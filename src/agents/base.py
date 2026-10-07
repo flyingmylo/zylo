@@ -1,12 +1,47 @@
 import copy
 import json
 import logging
+import re
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Protocol
 
 from src.llm.base import LLMProvider, LLMResponse
 from src.state import WritingState
 from src.tools.base import Tool
+
+
+class AgentKnowledgeBase(Protocol):
+    """Agent 视角的知识库契约：只声明写作流程实际依赖的能力。
+
+    具体的 KnowledgeBase 结构化满足本协议；测试替身同样只需结构满足
+    即可注入，单元测试因此不必拉起 chromadb 等重型依赖。
+    """
+
+    collection_name: str
+
+    def add_documents(self, documents: list[dict[str, str]]) -> None: ...
+
+    def retrieve(
+        self,
+        query_zh: str,
+        query_en: str = "",
+        top_k: int = 4,
+        candidate_pool: int = 6,
+    ) -> list[dict[str, str]]: ...
+
+    def count(self) -> int: ...
+
+
+class AgentSearchTool(Protocol):
+    """Researcher 视角的搜索契约：确定性检索流程只用到关键词与条数。
+
+    max_results 声明为仅关键字参数，以兼容实现方各自的位置参数排布
+    （如 SearchTool 在 query 之后还有 search_depth）。
+    """
+
+    async def search(
+        self, query: str, *, max_results: int = 5
+    ) -> list[dict[str, Any]]: ...
 
 
 class BaseAgent(ABC):
@@ -60,6 +95,36 @@ class BaseAgent(ABC):
     async def run(self, state: WritingState) -> WritingState:
         """子类具体执行流程与状态更新"""
         ...
+
+    @staticmethod
+    def _parse_llm_json(raw: str) -> Any:
+        """从 LLM 输出中安全解析 JSON 载荷（对象或数组），供各 Agent 结构化输出环节复用。
+
+        解析分两级：剥掉 markdown 代码围栏后直接解析；失败再用正则截取最外层
+        {...} / [...] 块重试（模型偶发在 JSON 前后夹带解释文字）。
+        所有解析异常在本函数内吞掉并返回 None，由调用方决定兜底值——
+        容错路径自身绝不允许再抛异常（回归：except 块内的二次 json.loads
+        曾把整条写作流程直接打崩）。
+        """
+        text = raw.strip()
+        if text.startswith("```json"):
+            text = text[7:].rsplit("```", 1)[0].strip()
+        elif text.startswith("```"):
+            text = text[3:].rsplit("```", 1)[0].strip()
+
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+
+        for pattern in (r"\{.*\}", r"\[.*\]"):
+            match = re.search(pattern, text, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    continue
+        return None
 
     def _get_tool_schemas(self) -> list[dict[str, Any]] | None:
         """返回注册时快照的 JSON Schema；无工具时返回 None 而非空列表。"""

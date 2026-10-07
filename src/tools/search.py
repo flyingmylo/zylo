@@ -1,3 +1,4 @@
+import asyncio
 import os
 from typing import Any, Literal
 
@@ -69,8 +70,13 @@ class SearchTool:
             ]
 
         try:
-            res = self.client.search(
-                query=query, search_depth=search_depth, max_results=max_results
+            # TavilyClient 是同步 HTTP 客户端：直接 await 会阻塞整个事件循环，
+            # 连带卡住 Researcher 的并发原文抓取，必须移入工作线程
+            res = await asyncio.to_thread(
+                self.client.search,
+                query=query,
+                search_depth=search_depth,
+                max_results=max_results,
             )
             results = []
             for r in res.get("results", []):

@@ -10,9 +10,17 @@ import httpx
 import pymupdf
 from rich.console import Console
 
-from src.tools.web_reader import WebReader
+from src.tools.web_reader import MAX_REDIRECTS, WebReader
 
 console = Console()
+
+# 与 WebReader 一致的浏览器 UA；对 arXiv 等学术站点伪装浏览器可显著降低 403 率
+BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko)"
+)
+# 论文 PDF 远大于网页正文，上限单独放宽；超出即放弃下载，防止内存被单响应耗尽
+MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
 
 # 正则定义：全面覆盖现代 (YYMM.NNNNN) 与经典历史学科 (archive/YYMMNNN) 分类，兼容版本号
 ARXIV_URL_PATTERN = re.compile(
@@ -75,15 +83,99 @@ class DocumentReader:
             safe_id = identifier.replace("/", "_")
             return os.path.join(self.cache_dir, f"arxiv_{safe_id}.pdf")
 
-        # 普通 URL，提取或推导安全的文件名
+        # 域名与完整路径必须一起参与命名：不同站点（或同站点不同路径）的同名
+        # 文件若互撞缓存，会静默加载错误文献——那是事实性错误而非性能问题。
+        # query 串以短摘要区分版本；用 hostname 而非 netloc，避免凭据落进文件名。
         parsed = urllib.parse.urlparse(identifier)
-        filename = os.path.basename(parsed.path)
-        if not filename.lower().endswith(".pdf"):
-            clean_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", parsed.path.strip("/"))
-            if not clean_name:
-                clean_name = hashlib.md5(identifier.encode()).hexdigest()[:10]
-            filename = f"{clean_name}.pdf"
+        host_part = parsed.hostname or "unknown"
+        if parsed.port:
+            host_part = f"{host_part}_{parsed.port}"
+        host = re.sub(r"[^a-zA-Z0-9\-]", "_", host_part)
+        clean_path = re.sub(r"[^a-zA-Z0-9_\-]", "_", parsed.path.strip("/"))
+        if parsed.query:
+            clean_path += "_" + hashlib.md5(parsed.query.encode()).hexdigest()[:8]
+        if not clean_path:
+            clean_path = hashlib.md5(identifier.encode()).hexdigest()[:10]
+        # 截断保护：部分文件系统对文件名长度有 255 字节硬限制
+        filename = f"{host}_{clean_path[:120]}.pdf"
         return os.path.join(self.cache_dir, filename)
+
+    def _load_cached_pdf(self, cache_path: str) -> list[dict[str, str]] | None:
+        """读取缓存 PDF；文件损坏时删除缓存并返回 None，交由调用方重新获取。
+
+        损坏缓存多为下载中断的残留：不清理的话，之后每次运行都会在
+        缓存命中分支崩溃，该资料从此永久不可用。
+        """
+        if not (os.path.exists(cache_path) and os.path.getsize(cache_path) > 0):
+            return None
+        try:
+            return self.read_file(cache_path)
+        except pymupdf.FileDataError:
+            console.print(
+                f"[yellow]! 缓存文件已损坏，删除后重新获取: [cyan]{cache_path}[/cyan][/yellow]"
+            )
+            os.remove(cache_path)
+            return None
+
+    async def _download_pdf(
+        self,
+        url: str,
+        cache_path: str,
+        timeout: float = 30.0,
+        max_bytes: int = MAX_DOWNLOAD_BYTES,
+    ) -> bool:
+        """流式下载 PDF 到缓存路径，成功返回 True。
+
+        与 WebReader 保持同一套防护标准：
+        - 逐跳 SSRF 校验：初始 URL 与每次重定向都不允许落入非公网段
+        - 逐块接收并在超过 max_bytes 时立即放弃，不落盘半成品
+        - 落盘前校验 %PDF 魔术字节，content-type 说谎的响应直接拒绝
+        """
+        current_url = url
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout, follow_redirects=False
+            ) as client:
+                for _ in range(MAX_REDIRECTS + 1):
+                    await WebReader.validate_public_url(current_url)
+                    async with client.stream(
+                        "GET", current_url, headers={"User-Agent": BROWSER_UA}
+                    ) as res:
+                        if res.is_redirect:
+                            location = res.headers.get("location")
+                            if not location:
+                                return False
+                            current_url = urllib.parse.urljoin(current_url, location)
+                            continue
+                        if res.status_code != 200:
+                            return False
+                        content_type = res.headers.get("content-type", "").lower()
+                        looks_like_pdf = (
+                            "application/pdf" in content_type
+                            or current_url.lower().endswith(".pdf")
+                        )
+                        if not looks_like_pdf:
+                            return False
+                        body = bytearray()
+                        async for chunk in res.aiter_bytes():
+                            body.extend(chunk)
+                            if len(body) > max_bytes:
+                                return False
+                        if not bytes(body[:5]).startswith(b"%PDF"):
+                            return False
+                        await asyncio.to_thread(
+                            Path(cache_path).write_bytes, bytes(body)
+                        )
+                        return True
+        except (
+            ValueError,
+            LookupError,
+            OSError,
+            httpx.HTTPError,
+            httpx.InvalidURL,
+        ):
+            return False
+        return False
 
     async def read_source(self, source: str) -> list[dict[str, str]]:
         """
@@ -133,53 +225,36 @@ class DocumentReader:
         """
         处理 arXiv 论文：
         1. 检查 references/ 下是否已有 arxiv_<id>.pdf 本地持久化缓存
-        2. 若无则流式下载并存入 references/，实现本地沉淀
+        2. 若无则流式下载（带 SSRF 校验与大小上限）并存入 references/，实现本地沉淀
         3. 优雅降级到 HTML Abstract 抓取
         """
         cache_path = self._get_cache_path(arxiv_id, is_arxiv=True)
 
-        # 命中本地磁盘缓存
-        if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
+        # 命中本地磁盘缓存（损坏缓存会被自动清理并返回 None，落入重下流程）
+        cached = self._load_cached_pdf(cache_path)
+        if cached is not None:
             console.print(
                 f"[bold green]✓[/bold green] 检测到本地已缓存论文: [cyan]{cache_path}[/cyan]，直接加载"
             )
-            return self.read_file(cache_path)
+            return cached
 
         pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
         fallback_url = f"https://export.arxiv.org/pdf/{arxiv_id}.pdf"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko)"
-        }
 
         console.print(
             f"[bold cyan]⬇ 正在从 arXiv 获取论文 PDF...[/bold cyan] [dim]({pdf_url})[/dim]"
         )
-        download_success = False
 
         for target in [pdf_url, fallback_url]:
-            try:
-                async with httpx.AsyncClient(
-                    timeout=45.0, follow_redirects=True
-                ) as client:
-                    res = await client.get(target, headers=headers)
-                    content_type = res.headers.get("content-type", "").lower()
-                    if res.status_code == 200 and (
-                        "application/pdf" in content_type
-                        or res.content.startswith(b"%PDF")
-                    ):
-                        await asyncio.to_thread(
-                            Path(cache_path).write_bytes, res.content
-                        )
-                        console.print(
-                            f"[bold green]✓[/bold green] 已下载论文并持久化缓存至: [cyan]{cache_path}[/cyan]"
-                        )
-                        download_success = True
-                        break
-            except (httpx.HTTPError, httpx.InvalidURL, OSError):
-                continue
-
-        if download_success:
-            return self.read_file(cache_path)
+            if await self._download_pdf(target, cache_path, timeout=45.0):
+                console.print(
+                    f"[bold green]✓[/bold green] 已下载论文并持久化缓存至: [cyan]{cache_path}[/cyan]"
+                )
+                chunks = self._load_cached_pdf(cache_path)
+                if chunks is not None:
+                    return chunks
+                # 下载内容解析失败，缓存已被清理；不再换源，直接走 Abstract 降级
+                break
 
         # 降级尝试拉取摘要页
         console.print(
@@ -199,45 +274,25 @@ class DocumentReader:
         - 若为普通网页，提取正文清洗切块
         """
         cache_path = self._get_cache_path(url, is_arxiv=False)
-        if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
+        cached = self._load_cached_pdf(cache_path)
+        if cached is not None:
             console.print(
                 f"[bold green]✓[/bold green] 检测到本地已缓存文件: [cyan]{cache_path}[/cyan]，直接加载"
             )
-            return self.read_file(cache_path)
+            return cached
 
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko)"
-        }
+        if await self._download_pdf(url, cache_path):
+            console.print(
+                f"[bold green]✓[/bold green] 已下载文件并持久化缓存至: [cyan]{cache_path}[/cyan]"
+            )
+            chunks = self._load_cached_pdf(cache_path)
+            if chunks is not None:
+                return chunks
+            # 下载内容损坏，缓存已被清理，降级网页抓取
 
-        try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                res = await client.get(url, headers=headers)
-                content_type = res.headers.get("content-type", "").lower()
-
-                if res.status_code == 200 and (
-                    "application/pdf" in content_type
-                    or res.content.startswith(b"%PDF")
-                    or url.lower().endswith(".pdf")
-                ):
-                    await asyncio.to_thread(Path(cache_path).write_bytes, res.content)
-                    console.print(
-                        f"[bold green]✓[/bold green] 已下载文件并持久化缓存至: [cyan]{cache_path}[/cyan]"
-                    )
-                    return self.read_file(cache_path)
-
-            # 否则作为普通网页抓取
-            text = await WebReader.fetch_and_clean(url)
-            if text:
-                return self.chunk_text(text, source=url)
-        except (
-            httpx.HTTPError,
-            httpx.InvalidURL,
-            OSError,
-            pymupdf.FileDataError,
-        ):
-            text = await WebReader.fetch_and_clean(url)
-            if text:
-                return self.chunk_text(text, source=url)
+        text = await WebReader.fetch_and_clean(url)
+        if text:
+            return self.chunk_text(text, source=url)
 
         return []
 

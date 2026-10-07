@@ -1,6 +1,3 @@
-import json
-import re
-
 from src.llm.base import LLMProvider
 from src.prompts import PLANNER_SYSTEM_PROMPT
 from src.state import SectionSpec, Stage, WritingState
@@ -39,55 +36,46 @@ class PlannerAgent(BaseAgent):
             temperature=0.4,
         )
 
-        raw = resp.content.strip()
-        # 清理可能附带的 markdown 标记
-        if raw.startswith("```json"):
-            raw = raw[7:].rsplit("```", 1)[0].strip()
-        elif raw.startswith("```"):
-            raw = raw[3:].rsplit("```", 1)[0].strip()
-
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            # 正则容错提取第一个 json object
-            match = re.search(r"\{.*\}", raw, re.DOTALL)
-            if match:
-                data = json.loads(match.group(0))
-            else:
-                data = {
-                    "outline_title": f"{state.topic} 深度技术解析与实践指南",
-                    "target_total_words": 3000,
-                    "sections": [
-                        {
-                            "title": "一、背景与核心痛点剖析",
-                            "target_words": 700,
-                            "focus_points": ["核心问题背景", "传统架构局限性"],
-                            "retrieval_query_zh": f"{state.topic} 痛点与背景",
-                            "retrieval_query_en": f"{state.topic} challenges and limitations",
-                        },
-                        {
-                            "title": "二、核心架构与技术原理",
-                            "target_words": 1200,
-                            "focus_points": ["核心设计机制", "关键算法与交互链路"],
-                            "retrieval_query_zh": f"{state.topic} 核心架构 原理",
-                            "retrieval_query_en": f"{state.topic} architecture and mechanisms",
-                        },
-                        {
-                            "title": "三、工程落地与最佳实践",
-                            "target_words": 800,
-                            "focus_points": ["典型生产环境配置", "性能优化与避坑指南"],
-                            "retrieval_query_zh": f"{state.topic} 实践 优化",
-                            "retrieval_query_en": f"{state.topic} best practices production deployment",
-                        },
-                        {
-                            "title": "四、总结与未来展望",
-                            "target_words": 300,
-                            "focus_points": ["技术趋势", "演进方向"],
-                            "retrieval_query_zh": f"{state.topic} 趋势",
-                            "retrieval_query_en": f"{state.topic} future trends",
-                        },
-                    ],
-                }
+        data = self._parse_llm_json(resp.content)
+        raw_sections = data.get("sections") if isinstance(data, dict) else None
+        if not isinstance(raw_sections, list) or not raw_sections:
+            # 解析失败、输出不是 JSON 对象、或 sections 缺失/非列表/为空，
+            # 都属于模型输出不可用：落模板大纲继续写作，
+            # 宁可用模板也不要 0 节空文章，更不能让流程在规划阶段崩溃
+            data = {
+                "outline_title": f"{state.topic} 深度技术解析与实践指南",
+                "target_total_words": 3000,
+                "sections": [
+                    {
+                        "title": "一、背景与核心痛点剖析",
+                        "target_words": 700,
+                        "focus_points": ["核心问题背景", "传统架构局限性"],
+                        "retrieval_query_zh": f"{state.topic} 痛点与背景",
+                        "retrieval_query_en": f"{state.topic} challenges and limitations",
+                    },
+                    {
+                        "title": "二、核心架构与技术原理",
+                        "target_words": 1200,
+                        "focus_points": ["核心设计机制", "关键算法与交互链路"],
+                        "retrieval_query_zh": f"{state.topic} 核心架构 原理",
+                        "retrieval_query_en": f"{state.topic} architecture and mechanisms",
+                    },
+                    {
+                        "title": "三、工程落地与最佳实践",
+                        "target_words": 800,
+                        "focus_points": ["典型生产环境配置", "性能优化与避坑指南"],
+                        "retrieval_query_zh": f"{state.topic} 实践 优化",
+                        "retrieval_query_en": f"{state.topic} best practices production deployment",
+                    },
+                    {
+                        "title": "四、总结与未来展望",
+                        "target_words": 300,
+                        "focus_points": ["技术趋势", "演进方向"],
+                        "retrieval_query_zh": f"{state.topic} 趋势",
+                        "retrieval_query_en": f"{state.topic} future trends",
+                    },
+                ],
+            }
 
         state.outline_title = data.get("outline_title", f"{state.topic} 深度解析")
         state.target_total_words = data.get("target_total_words", 3000)

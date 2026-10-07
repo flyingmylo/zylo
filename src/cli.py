@@ -1,6 +1,6 @@
 import asyncio
 import sys
-from typing import Annotated, Optional
+from typing import Annotated
 
 import typer
 from rich import box

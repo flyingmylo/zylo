@@ -1,7 +1,6 @@
 from dataclasses import dataclass, field
 from enum import Enum
 
-
 # 审稿意见的全局作用域标记：不针对任何具体小节的意见统一归入该值
 GLOBAL_SCOPE = "全局"
 

@@ -38,3 +38,9 @@ filterwarnings = [
     "ignore::DeprecationWarning:.*(SwigPy|swigvarlink).*",
     "ignore::DeprecationWarning:importlib._bootstrap"
 ]
+
+# pyright 语言服务器据此用项目根 .venv 解析第三方导入，
+# 相对路径写法在项目搬迁/venv 重建后依然成立
+[tool.pyright]
+venvPath = "."
+venv = ".venv"

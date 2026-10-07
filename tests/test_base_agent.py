@@ -4,7 +4,8 @@ import logging
 import pytest
 
 from src.agents.base import BaseAgent
-from src.agents.researcher import ResearcherAgent
+from src.agents.planner import PlannerAgent
+from src.agents.researcher import FetchCandidate, ResearcherAgent
 from src.agents.reviewer import ReviewerAgent
 from src.agents.writer import WriterAgent
 from src.llm.base import LLMProvider, LLMResponse, ToolCall
@@ -80,6 +81,185 @@ def _tool_call(
 # --------------------------------------------------------------------------
 # Token 统计
 # --------------------------------------------------------------------------
+
+
+def test_parse_llm_json_never_raises_on_garbage():
+    """安全解析器的契约：任何输入都不得抛异常，失败返回 None。
+
+    回归：Planner/Reviewer 曾在 except 块里二次 json.loads，
+    噪声文字中夹带坏 JSON 时异常直接逃逸，打崩整条写作流程。
+    """
+    assert BaseAgent._parse_llm_json('```json\n{"a": 1}\n```') == {"a": 1}
+    assert BaseAgent._parse_llm_json('```\n{"a": 1}\n```') == {"a": 1}
+    assert BaseAgent._parse_llm_json('好的，结果如下 {"a": 1} 请查收') == {"a": 1}
+    assert BaseAgent._parse_llm_json('["词1", "词2"]') == ["词1", "词2"]
+    assert BaseAgent._parse_llm_json('检索词：["词1"] 完毕') == ["词1"]
+
+    # 双级解析都失败：返回 None，绝不抛异常
+    assert BaseAgent._parse_llm_json('好的 {"sections": [坏}, 完毕') is None
+    assert BaseAgent._parse_llm_json("") is None
+    assert BaseAgent._parse_llm_json("纯文本没有 JSON") is None
+    assert BaseAgent._parse_llm_json('```json\n{"broken": [\n```') is None
+
+
+# --------------------------------------------------------------------------
+# Planner / Reviewer / Researcher 容错路径回归
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_planner_unparseable_json_falls_back_to_default_outline():
+    """大纲 JSON 彻底无法解析时必须落模板大纲，而不是抛异常。"""
+    llm = ScriptedLLM([LLMResponse(content='好的，大纲如下 {"sections": [坏}, 请过目')])
+    state = await PlannerAgent(llm).run(WritingState(topic="KV-Cache"))
+
+    assert len(state.sections) == 4
+    assert state.outline_title
+    assert all(s.retrieval_query_zh for s in state.sections)
+
+
+@pytest.mark.asyncio
+async def test_planner_valid_json_with_unusable_sections_falls_back():
+    """输出是合法 JSON 对象但 sections 缺失/非列表/为空时同样落模板大纲。
+
+    否则 0 节空大纲会一路走到导出，产出空文章。
+    """
+    for content in (
+        '{"queries": ["无关字段"]}',  # 合法对象但没有 sections
+        '{"sections": "一、串"},',  # sections 非列表
+        '{"sections": []}',  # 显式空大纲
+    ):
+        llm = ScriptedLLM([LLMResponse(content=content)])
+        state = await PlannerAgent(llm).run(WritingState(topic="KV-Cache"))
+        assert len(state.sections) == 4, f"sections 不可用时必须兜底: {content}"
+
+
+@pytest.mark.asyncio
+async def test_reviewer_unparseable_json_falls_back_without_crashing():
+    """审稿 JSON 彻底无法解析时落默认通过，且不得抛异常。"""
+    llm = ScriptedLLM([LLMResponse(content='评审 {"passed": 坏} 完')])
+    state = WritingState(topic="t", outline_title="标题", full_draft="正文")
+    state.sections = [SectionSpec(title="一、节", target_words=100)]
+
+    state = await ReviewerAgent(llm).run(state)
+
+    assert state.review_passed is True
+    assert state.review_score == 85.0
+    assert "无法解析审稿人详细 JSON" in state.critiques[0]
+
+
+@pytest.mark.asyncio
+async def test_reviewer_string_false_is_not_treated_as_passed():
+    """回归：passed="false"（字符串）曾被 bool() 判为 True，低分稿被放行。"""
+    llm = ScriptedLLM(
+        [
+            LLMResponse(
+                content=json.dumps(
+                    {
+                        "passed": "false",
+                        "score": 60.0,
+                        "critiques": ["术语对照缺失"],
+                        "actionable_revisions": [],
+                    }
+                )
+            )
+        ]
+    )
+    state = WritingState(topic="t", outline_title="标题", full_draft="正文")
+    state.sections = [SectionSpec(title="一、节", target_words=100)]
+
+    state = await ReviewerAgent(llm).run(state)
+
+    assert state.review_passed is False
+    assert state.review_score == 60.0
+
+
+@pytest.mark.asyncio
+async def test_reviewer_coerces_common_truthy_string_variants():
+    """常见宽松布尔形态的规范化行为。"""
+    cases = [
+        (True, True),
+        ("true", True),
+        ("TRUE", True),
+        (1, True),
+        ("false", False),
+        ("0", False),
+        (0, False),
+        (None, True),  # 无法识别/缺失时回退 default
+    ]
+    for value, expected in cases:
+        assert ReviewerAgent._coerce_bool(value, default=True) is expected
+
+
+@pytest.mark.asyncio
+async def test_reviewer_malformed_score_falls_back_to_default():
+    """score 为非数值字符串时回退默认分，审稿流程不中断。"""
+    llm = ScriptedLLM(
+        [
+            LLMResponse(
+                content=json.dumps(
+                    {"passed": False, "score": "八十八", "critiques": [], "actionable_revisions": []}
+                )
+            )
+        ]
+    )
+    state = WritingState(topic="t", outline_title="标题", full_draft="正文")
+    state.sections = [SectionSpec(title="一、节", target_words=100)]
+
+    state = await ReviewerAgent(llm).run(state)
+
+    assert state.review_score == 85.0
+    assert state.review_passed is False  # passed 显式为 false，仅 score 回退默认值
+
+
+@pytest.mark.asyncio
+async def test_researcher_non_list_keywords_fall_back_to_topic(monkeypatch):
+    """回归：检索词输出 {"queries": [...]} 之类对象时曾抛 KeyError。
+
+    必须回退为原始主题继续调研，而不是打断整个阶段。
+    """
+
+    async def no_fetch(url, timeout=10.0):
+        return ""
+
+    monkeypatch.setattr(WebReader, "fetch_and_clean", no_fetch)
+    search_tool = StubSearchTool()
+    llm = ScriptedLLM(
+        [
+            LLMResponse(content='{"queries": ["a", "b"]}'),  # 合法 JSON 但非数组
+            LLMResponse(content="调研综述正文"),
+        ]
+    )
+
+    state = await ResearcherAgent(
+        llm, knowledge_base=FakeKnowledgeBase(), search_tool=search_tool
+    ).run(WritingState(topic="原始主题"))
+
+    assert search_tool.queries == ["原始主题"]
+    assert state.research_summary == "调研综述正文"
+
+
+@pytest.mark.asyncio
+async def test_researcher_filters_non_string_keyword_entries(monkeypatch):
+    """数组里混入非字符串元素：剔除后继续，全部无效才回退主题。"""
+
+    async def no_fetch(url, timeout=10.0):
+        return ""
+
+    monkeypatch.setattr(WebReader, "fetch_and_clean", no_fetch)
+    search_tool = StubSearchTool()
+    llm = ScriptedLLM(
+        [
+            LLMResponse(content='["有效词", 123, null, "  "]'),
+            LLMResponse(content="调研综述正文"),
+        ]
+    )
+
+    await ResearcherAgent(
+        llm, knowledge_base=FakeKnowledgeBase(), search_tool=search_tool
+    ).run(WritingState(topic="原始主题"))
+
+    assert search_tool.queries == ["有效词"]
 
 
 @pytest.mark.asyncio
@@ -326,7 +506,9 @@ def test_duplicate_tool_name_warns_and_last_registration_wins(caplog):
     with caplog.at_level(logging.WARNING):
         agent = EchoAgent(ScriptedLLM([]), tools=[first, second])
 
-    assert len(agent._get_tool_schemas()) == 1
+    schemas = agent._get_tool_schemas()
+    assert schemas is not None
+    assert len(schemas) == 1
     assert agent._tool_map["stub_tool"] is second
     assert any("重复注册" in r.getMessage() for r in caplog.records)
 
@@ -338,7 +520,9 @@ def test_schema_snapshot_prevents_advertise_dispatch_split():
 
     tool.schema["function"]["name"] = "renamed_after_registration"
 
-    assert agent._get_tool_schemas()[0]["function"]["name"] == "stub_tool"
+    schemas = agent._get_tool_schemas()
+    assert schemas is not None
+    assert schemas[0]["function"]["name"] == "stub_tool"
     assert list(agent._tool_map) == ["stub_tool"]
 
 
@@ -413,32 +597,42 @@ async def test_search_tool_execute_rejects_invalid_depth_and_missing_query(monke
 
 
 class StubSearchTool:
-    """Researcher 的确定性检索替身，不满足 Tool 协议也不需要满足。"""
+    """Researcher 的确定性检索替身，满足 AgentSearchTool 协议。"""
 
-    def __init__(self, results: list[dict] | None = None):
+    def __init__(self, results: list[dict[str, str]] | None = None):
         self.queries: list[str] = []
         self._results = results or [
             {"title": "T", "url": "https://example.com", "content": "检索到的片段"}
         ]
 
-    async def search(self, query, max_results=5):
+    async def search(
+        self, query: str, max_results: int = 5
+    ) -> list[dict[str, str]]:
         self.queries.append(query)
         return [dict(r) for r in self._results]
 
 
 class FakeKnowledgeBase:
+    """满足 AgentKnowledgeBase 协议的轻量替身，只记录入库内容、检索恒空。"""
+
     collection_name = "fake_collection"
 
     def __init__(self):
-        self.documents: list[dict] = []
+        self.documents: list[dict[str, str]] = []
 
-    def add_documents(self, documents):
+    def add_documents(self, documents: list[dict[str, str]]) -> None:
         self.documents.extend(documents)
 
-    def retrieve(self, **kwargs):
+    def retrieve(
+        self,
+        query_zh: str,
+        query_en: str = "",
+        top_k: int = 4,
+        candidate_pool: int = 6,
+    ) -> list[dict[str, str]]:
         return []
 
-    def count(self):
+    def count(self) -> int:
         return len(self.documents)
 
 
@@ -595,7 +789,7 @@ async def test_researcher_fetch_exception_falls_back_to_snippet(monkeypatch):
     agent = ResearcherAgent(
         ScriptedLLM([]), knowledge_base=FakeKnowledgeBase(), search_tool=None
     )
-    candidate = {
+    candidate: FetchCandidate = {
         "url": "https://example.com",
         "snippet": {"text": "摘要", "source": "https://example.com", "page": "1"},
     }

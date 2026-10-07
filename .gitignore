@@ -57,6 +57,7 @@ references/*
 .DS_Store
 .idea/
 .vscode/
+.zed/
 *.swp
 *.swo
 *~

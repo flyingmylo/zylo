@@ -1,17 +1,14 @@
 import asyncio
-import json
 from collections import defaultdict
 from typing import TypedDict
 
 from src.llm.base import LLMProvider
 from src.prompts import RESEARCHER_SYSTEM_PROMPT
 from src.state import Stage, WritingState
-from src.tools.knowledge_base import KnowledgeBase
 from src.tools.pdf_reader import DocumentReader
-from src.tools.search import SearchTool
 from src.tools.web_reader import WebReader
 
-from .base import BaseAgent
+from .base import AgentKnowledgeBase, AgentSearchTool, BaseAgent
 
 # 单次调研抓取搜索结果原文的 URL 上限与并发度
 MAX_FULLTEXT_FETCH = 8
@@ -40,8 +37,8 @@ class ResearcherAgent(BaseAgent):
     def __init__(
         self,
         llm: LLMProvider,
-        knowledge_base: KnowledgeBase,
-        search_tool: SearchTool | None = None,
+        knowledge_base: AgentKnowledgeBase,
+        search_tool: AgentSearchTool | None = None,
     ):
         super().__init__(
             name="Researcher",
@@ -76,19 +73,18 @@ class ResearcherAgent(BaseAgent):
                 {"role": "user", "content": f"技术主题: {state.topic}"},
             ]
             kw_resp = await self._chat(kw_prompt, state, temperature=0.3)
-            queries = []
-            try:
-                content = kw_resp.content.strip()
-                if content.startswith("```json"):
-                    content = content[7:].rsplit("```", 1)[0].strip()
-                elif content.startswith("```"):
-                    content = content[3:].rsplit("```", 1)[0].strip()
-                queries = json.loads(content)
-            except Exception as exc:  # noqa: BLE001
+            parsed = self._parse_llm_json(kw_resp.content)
+            # 只接受非空字符串数组：模型偶发输出 {"queries": [...]} 之类的对象，
+            # 直接切片会抛 KeyError 打断整个调研阶段
+            queries = (
+                [q.strip() for q in parsed if isinstance(q, str) and q.strip()]
+                if isinstance(parsed, list)
+                else []
+            )
+            if not queries:
                 self.logger.warning(
-                    "检索词 JSON 解析失败（%s：%s），回退使用原始主题作为检索词",
-                    type(exc).__name__,
-                    exc,
+                    "检索词输出不可用（%s），回退使用原始主题作为检索词",
+                    type(parsed).__name__ if parsed is not None else "空输出",
                 )
                 queries = [state.topic]
 
