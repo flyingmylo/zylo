@@ -15,8 +15,17 @@ class StubExecutor:
         self.state = state or WritingState(topic="t")
         self.error = error
         self.calls: list[dict] = []
+        self.checkpoints: list[object] = []
 
-    async def execute(self, topic, local_files=None, extra_instructions="", output_dir="output"):
+    async def execute(
+        self,
+        topic,
+        local_files=None,
+        extra_instructions="",
+        output_dir="output",
+        resume_state=None,
+        on_checkpoint=None,
+    ):
         self.calls.append(
             {
                 "topic": topic,
@@ -25,6 +34,9 @@ class StubExecutor:
                 "output_dir": output_dir,
             }
         )
+        if on_checkpoint is not None:
+            on_checkpoint(self.state)  # 模拟一次阶段快照
+            self.checkpoints.append(self.state)
         if self.error:
             raise self.error
         self.state.final_markdown = "# 成稿"

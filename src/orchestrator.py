@@ -42,8 +42,22 @@ class WritingOrchestrator:
         local_files: list[str] | None = None,
         extra_instructions: str = "",
         output_dir: str = "output",
+        resume_state: WritingState | None = None,
+        on_checkpoint: Callable[[WritingState], None] | None = None,
     ) -> WritingState:
-        state = WritingState(
+        """驱动一次完整写作；可从快照 resume，已完成阶段直接跳过。
+
+        - resume_state：来自最新阶段快照的反序列化状态。阶段完成度以
+          current_stage 判定（各 agent.run 完成后 stage 停留在本阶段），
+          research/planner 已完成则不再执行，LLM 不重复扣费；
+        - on_checkpoint：阶段边界回调（research/planner/每轮审稿后），
+          调用方在此落快照；默认 no-op。
+        注意：resume 时进程内知识库为空（检索向量需 M2-4 持久化后才能
+        跨进程恢复），但 research_summary 等文本产出都在 state 里，写作
+        不受影响。
+        """
+        checkpoint = on_checkpoint or (lambda s: None)
+        state = resume_state or WritingState(
             topic=topic,
             local_files=local_files or [],
             extra_instructions=extra_instructions,
@@ -66,19 +80,32 @@ class WritingOrchestrator:
         writer = WriterAgent(self.llm, knowledge_base=kb)
         reviewer = ReviewerAgent(self.llm)
 
+        def completed(stage: Stage) -> bool:
+            """该阶段是否已在快照中完成（Stage 枚举定义序即执行序）。"""
+            order = [s for s in Stage]
+            return order.index(state.current_stage) >= order.index(stage)
+
         # ====== 阶段 1: 调研与知识库构建 ======
-        self.on_progress(
-            "🔍 启动 Researcher 进行文献解析、网络检索与知识库构建...", state
-        )
-        state = await researcher.run(state)
-        self.on_progress(f"✅ 调研完成，入库向量片段 {kb.count()} 条。", state)
+        if not completed(Stage.RESEARCHING):
+            self.on_progress(
+                "🔍 启动 Researcher 进行文献解析、网络检索与知识库构建...", state
+            )
+            state = await researcher.run(state)
+            self.on_progress(f"✅ 调研完成，入库向量片段 {kb.count()} 条。", state)
+        else:
+            self.on_progress("⏭️ 快照显示调研已完成，跳过 Researcher。", state)
+        checkpoint(state)
 
         # ====== 阶段 2: 大纲规划 ======
-        self.on_progress("📐 启动 Planner 制定深度技术架构大纲与双语检索词...", state)
-        state = await planner.run(state)
-        self.on_progress(
-            f"✅ 大纲制定完毕，共 {len(state.sections)} 个深度章节。", state
-        )
+        if not completed(Stage.PLANNING):
+            self.on_progress("📐 启动 Planner 制定深度技术架构大纲与双语检索词...", state)
+            state = await planner.run(state)
+            self.on_progress(
+                f"✅ 大纲制定完毕，共 {len(state.sections)} 个深度章节。", state
+            )
+        else:
+            self.on_progress("⏭️ 快照显示大纲已就绪，跳过 Planner。", state)
+        checkpoint(state)
 
         # ====== 阶段 3 & 4: 写作与审稿反思回路 ======
         best_snapshot: dict | None = None
@@ -113,6 +140,10 @@ class WritingOrchestrator:
                     "critiques": list(state.critiques),
                     "actionable_revisions": deepcopy(state.actionable_revisions),
                 }
+
+            # 审稿完成为最细粒度快照点：resume 自此重入修订轮，
+            # 已生成正文都在 section_drafts 里，重写仅限被点名小节
+            checkpoint(state)
 
             if state.review_passed:
                 state.selected_revision = state.revision_count
@@ -158,6 +189,7 @@ class WritingOrchestrator:
         state.final_markdown = self._format_final_markdown(state)
         self._export_to_file(state, output_dir=output_dir)
         self.on_progress("🚀 文章已生成并成功导出至 output 目录！", state)
+        checkpoint(state)
 
         return state
 

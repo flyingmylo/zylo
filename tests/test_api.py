@@ -13,7 +13,15 @@ class StubExecutor:
     def __init__(self, state: WritingState | None = None):
         self.state = state or WritingState(topic="t")
 
-    async def execute(self, topic, local_files=None, extra_instructions="", output_dir="output"):
+    async def execute(
+        self,
+        topic,
+        local_files=None,
+        extra_instructions="",
+        output_dir="output",
+        resume_state=None,
+        on_checkpoint=None,
+    ):
         self.state.outline_title = f"关于{topic}的深度解析"
         self.state.final_markdown = f"# 关于{topic}的深度解析\n\n正文"
         self.state.review_score = 90.0

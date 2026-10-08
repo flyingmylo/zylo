@@ -7,6 +7,7 @@ from src.llm.base import LLMProvider, LLMResponse
 from src.llm.mock import MOCK_USAGE, MockLLMProvider
 from src.orchestrator import WritingOrchestrator
 from src.runs import RunStatus
+from src.state import deserialize_state, serialize_state
 
 
 async def _chat(provider: LLMProvider, system: str, user: str = "") -> LLMResponse:
@@ -123,3 +124,43 @@ async def test_full_pipeline_offline_with_real_orchestrator(tmp_path):
     assert events[0].status.value == "started"
     assert events[-1].status.value == "completed"
     assert events[-1].payload["total_tokens"] == state.token_usage["total_tokens"]
+
+
+# --------------------------------------------------------------------------
+# M2-3：断点恢复——已完成阶段不重复执行
+# --------------------------------------------------------------------------
+
+
+async def test_resume_skips_completed_stages(tmp_path):
+    """从 PLANNING 快照 resume：调研与大纲不重跑（LLM 调用数少 2 次）。"""
+    # 第一次运行：收集各阶段快照
+    first_provider = MockLLMProvider()
+    checkpoints: dict[str, dict] = {}
+
+    def collect(state):
+        checkpoints[state.current_stage.value] = serialize_state(state)
+
+    first_state = await WritingOrchestrator(
+        llm=first_provider, embedding_provider=DummyEmbeddingProvider()
+    ).execute(topic="MoE 路由", output_dir=str(tmp_path), on_checkpoint=collect)
+
+    assert "planning" in checkpoints
+    assert first_provider.call_count == 10
+
+    # 模拟崩溃后恢复：PLANNING 快照 + 全新进程（全新 Provider/Orchestrator）
+    resume_provider = MockLLMProvider()
+    resumed_state = await WritingOrchestrator(
+        llm=resume_provider, embedding_provider=DummyEmbeddingProvider()
+    ).execute(
+        topic="MoE 路由",
+        output_dir=str(tmp_path),
+        resume_state=deserialize_state(checkpoints["planning"]),
+    )
+
+    # 调研与规划被跳过：10 - 2 = 8 次 LLM 调用
+    assert resume_provider.call_count == 8
+    # 快照中的产出原样保留，文章照常完成
+    assert resumed_state.research_summary == first_state.research_summary
+    assert resumed_state.outline_title == first_state.outline_title
+    assert resumed_state.revision_count == 1
+    assert resumed_state.review_score == 92.0

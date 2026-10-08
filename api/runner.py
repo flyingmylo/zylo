@@ -6,13 +6,14 @@
 
 import asyncio
 import logging
+from collections.abc import Callable
 from typing import Any, Protocol
 
 from api.bus import TraceBus
 from api.store import RunStore
 from src.events import EventStatus, RunEvent, SpanKind
 from src.runs import Run, RunStatus
-from src.state import WritingState
+from src.state import WritingState, serialize_state
 
 logger = logging.getLogger("src.api.runner")
 
@@ -22,7 +23,11 @@ class RunNotFoundError(KeyError):
 
 
 class RunExecutor(Protocol):
-    """执行体的最小契约：现有 WritingOrchestrator 天然满足。"""
+    """执行体的最小契约：现有 WritingOrchestrator 天然满足。
+
+    参数排布必须与 WritingOrchestrator.execute 完全一致——
+    pyright 的协议匹配按位置参数对齐，多一个可选参数就会错位。
+    """
 
     async def execute(
         self,
@@ -30,6 +35,8 @@ class RunExecutor(Protocol):
         local_files: list[str] | None = None,
         extra_instructions: str = "",
         output_dir: str = "output",
+        resume_state: WritingState | None = None,
+        on_checkpoint: Callable[[WritingState], None] | None = None,
     ) -> WritingState: ...
 
 
@@ -102,6 +109,13 @@ class JobRunner:
         )
 
     async def _execute(self, run: Run, executor: RunExecutor, output_dir: str) -> None:
+        def on_checkpoint(state: WritingState) -> None:
+            """阶段边界落快照：崩溃后 resume 从此续跑，已付的 LLM 费用不打水漂。"""
+            if self.store:
+                self.store.save_state_snapshot(
+                    run.id, state.current_stage.value, serialize_state(state)
+                )
+
         try:
             run.transition(RunStatus.RUNNING)
             self._persist(run)
@@ -111,6 +125,7 @@ class JobRunner:
                 local_files=run.config.get("sources"),
                 extra_instructions=str(run.config.get("instructions", "")),
                 output_dir=output_dir,
+                on_checkpoint=on_checkpoint,
             )
             self._results[run.id] = state
             run.transition(RunStatus.COMPLETED)
@@ -165,3 +180,16 @@ class JobRunner:
         task = self._tasks.get(run_id)
         if task is not None:
             await asyncio.wait_for(task, timeout=300)
+
+
+def recover_stale_runs(store: RunStore) -> list[Run]:
+    """服务启动恢复：上一进程遗留的 RUNNING 已无宿主任务，统一落位 PARTIAL。
+
+    返回被恢复的 run 列表供上层提示用户；PARTIAL 可经 zylo resume 续跑。
+    """
+    recovered: list[Run] = []
+    for stale in store.runs_in_status(RunStatus.RUNNING):
+        stale.transition(RunStatus.PARTIAL)
+        store.upsert_run(stale)
+        recovered.append(stale)
+    return recovered

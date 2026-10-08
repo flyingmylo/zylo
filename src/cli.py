@@ -12,7 +12,8 @@ from src.embeddings.base import EmbeddingProvider
 from src.llm.config import LLMConfig
 from src.llm.openai_provider import OpenAICompatibleProvider
 from src.orchestrator import WritingOrchestrator
-from src.state import WritingState
+from src.runs import RunStatus
+from src.state import WritingState, serialize_state
 
 console = Console()
 app = typer.Typer(
@@ -329,6 +330,17 @@ def serve(
 
     # SQLite 事实来源：重启后运行列表、详情与事件历史仍可查询
     store = RunStore("data/zylo.db")
+
+    # 启动恢复：上一个进程遗留的 RUNNING 已无宿主任务，落位 PARTIAL，
+    # 用户可通过 zylo resume <run_id> 从最新快照续跑
+    from api.runner import recover_stale_runs
+
+    for stale in recover_stale_runs(store):
+        console.print(
+            f"[yellow]⚠ 检测到中断的运行 {stale.id}（{stale.topic}），"
+            f"已转为 PARTIAL，可用 zylo resume {stale.id} 续跑[/yellow]"
+        )
+
     bus = TraceBus()
     app = create_app(bus=bus, runner=JobRunner(bus, store), executor_factory=make_executor)
 
@@ -344,6 +356,92 @@ def serve(
         )
     )
     uvicorn.run(app, host=host, port=port)
+
+
+@app.command(
+    name="resume",
+    help="▶️ 从最新阶段快照续跑中断的任务（zylo resume <run_id>）",
+)
+def resume_cmd(
+    run_id: Annotated[str, typer.Argument(help="要恢复的运行 ID")],
+    output_dir: Annotated[str, typer.Option("-o", "--output-dir")] = "output",
+):
+    import asyncio
+
+    from api.store import RunStore
+    from src.state import deserialize_state
+
+    store = RunStore("data/zylo.db")
+    run = store.get_run(run_id)
+    if run is None:
+        console.print(f"[bold red]❌ 运行 {run_id} 不存在（数据库 data/zylo.db）[/bold red]")
+        raise typer.Exit(code=1)
+
+    if run.status.value not in ("partial", "failed"):
+        console.print(
+            f"[bold red]❌ 仅 PARTIAL/FAILED 状态可恢复，当前为 {run.status.value}；"
+            f"serve 启动时会把遗留的 RUNNING 自动转为 PARTIAL[/bold red]"
+        )
+        raise typer.Exit(code=1)
+
+    snapshot = store.latest_state_snapshot(run_id)
+    if snapshot is None:
+        console.print("[bold red]❌ 该运行没有可恢复的阶段快照[/bold red]")
+        raise typer.Exit(code=1)
+
+    try:
+        resume_state = deserialize_state(snapshot)
+    except ValueError as exc:
+        console.print(f"[bold red]❌ 快照不可用：{exc}[/bold red]")
+        raise typer.Exit(code=1) from None
+
+    config = LLMConfig()
+    if not config.api_key or not config.model:
+        console.print("[bold red]❌ 恢复需要 LLM_API_KEY 与 LLM_MODEL[/bold red]")
+        raise typer.Exit(code=1)
+
+    from src.embeddings.bge_provider import BGEM3EmbeddingProvider
+
+    console.print("[bold cyan]🔹 正在载入 BAAI/bge-m3 嵌入模型...[/bold cyan]")
+    embedding = BGEM3EmbeddingProvider()
+
+    def on_checkpoint(state) -> None:
+        store.save_state_snapshot(run_id, state.current_stage.value, serialize_state(state))
+
+    def progress(message: str, state) -> None:
+        console.print(f"[dim]{message}[/dim]")
+
+    run.transition(RunStatus.RUNNING)
+    store.upsert_run(run)
+
+    async def _run() -> WritingState:
+        return await WritingOrchestrator(
+            llm=OpenAICompatibleProvider(
+                api_key=config.api_key, model=config.model, base_url=config.base_url
+            ),
+            embedding_provider=embedding,
+            tavily_api_key=config.tavily_api_key or None,
+            progress_callback=progress,
+        ).execute(
+            topic=run.topic,
+            output_dir=output_dir,
+            resume_state=resume_state,
+            on_checkpoint=on_checkpoint,
+        )
+
+    console.print(f"[bold green]▶️ 从阶段 {resume_state.current_stage.value} 续跑 {run_id}[/bold green]")
+    try:
+        asyncio.run(_run())
+    except Exception as exc:  # noqa: BLE001 -- 恢复入口边界：任何异常转 FAILED 并保留快照
+        run.error = str(exc)
+        run.transition(RunStatus.FAILED)
+        store.upsert_run(run)
+        console.print(f"[bold red]❌ 续跑失败：{exc}[/bold red]")
+        raise typer.Exit(code=1) from None
+
+    run.transition(RunStatus.COMPLETED)
+    store.upsert_run(run)
+    console.print("[bold green]✅ 续跑完成，文章已导出[/bold green]")
 
 
 @app.command(
@@ -446,7 +544,7 @@ def show_config():
 
 def main():
     # 智能快捷注入 (Q2-A)：若直接输入 zylo "主题" 或仅输入 zylo，自动映射为 write 命令
-    subcommands = {"check", "config", "serve", "write"}
+    subcommands = {"check", "config", "resume", "serve", "write"}
     raw_args = sys.argv[1:]
     if raw_args:
         first = raw_args[0]
