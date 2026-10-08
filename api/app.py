@@ -44,6 +44,16 @@ def create_app(
         runner_.launch(run.id, request.app.state.executor_factory())
         return run.model_dump(mode="json")
 
+    @app.get(f"{API_PREFIX}/runs")
+    async def list_runs(request: Request, limit: int = 50, offset: int = 0) -> dict:
+        runner_: JobRunner = request.app.state.runner
+        runs = runner_.list_runs(limit=limit, offset=offset)
+        return {
+            "items": [run.model_dump(mode="json") for run in runs],
+            "limit": limit,
+            "offset": offset,
+        }
+
     @app.get(f"{API_PREFIX}/runs/{{run_id}}")
     async def get_run(run_id: str, request: Request) -> dict:
         run = request.app.state.runner.get(run_id)

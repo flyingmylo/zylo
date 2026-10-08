@@ -289,6 +289,7 @@ def serve(
     from api.app import create_app
     from api.bus import TraceBus
     from api.runner import JobRunner
+    from api.store import RunStore
 
     config = LLMConfig()
     # 嵌入模型权重 2GB：真实模式下进程内只加载一次，跨 run 复用
@@ -326,8 +327,10 @@ def serve(
             tavily_api_key=config.tavily_api_key or None,
         )
 
+    # SQLite 事实来源：重启后运行列表、详情与事件历史仍可查询
+    store = RunStore("data/zylo.db")
     bus = TraceBus()
-    app = create_app(bus=bus, runner=JobRunner(bus), executor_factory=make_executor)
+    app = create_app(bus=bus, runner=JobRunner(bus, store), executor_factory=make_executor)
 
     mode_desc = "[green]Mock 离线演示[/green]" if mock else "[yellow]真实模型[/yellow]"
     console.print(

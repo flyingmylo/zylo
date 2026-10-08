@@ -1,7 +1,7 @@
 """asyncio JobRunner：把写作运行变成可查询、可订阅的后台作业。
 
-M1 是单机内存版：注册表与结果都只在进程内，重启即失；
-M2 的 RunStore（SQLite）接入后接口保持不变。
+挂载 RunStore 后，运行与事件在内存之外同步落盘（SQLite 是事实来源，
+内存只是加速层）：进程重启后 run 列表与详情仍可查询。
 """
 
 import asyncio
@@ -9,6 +9,7 @@ import logging
 from typing import Any, Protocol
 
 from api.bus import TraceBus
+from api.store import RunStore
 from src.events import EventStatus, RunEvent, SpanKind
 from src.runs import Run, RunStatus
 from src.state import WritingState
@@ -35,8 +36,9 @@ class RunExecutor(Protocol):
 class JobRunner:
     """运行注册表 + 后台执行调度，状态迁移与事件发布的唯一入口。"""
 
-    def __init__(self, bus: TraceBus) -> None:
+    def __init__(self, bus: TraceBus, store: RunStore | None = None) -> None:
         self.bus: TraceBus = bus
+        self.store = store
         self._runs: dict[str, Run] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._results: dict[str, WritingState] = {}
@@ -55,17 +57,36 @@ class JobRunner:
             config={"sources": sources or [], "instructions": instructions},
         )
         self._runs[run.id] = run
+        self._persist(run)
         return run
 
     def get(self, run_id: str) -> Run:
-        try:
+        """内存优先，miss 时回落 SQLite（重启后的历史 run）并回填内存。"""
+        if run_id in self._runs:
             return self._runs[run_id]
-        except KeyError:
-            raise RunNotFoundError(run_id) from None
+        if self.store:
+            persisted = self.store.get_run(run_id)
+            if persisted is not None:
+                self._runs[run_id] = persisted
+                return persisted
+        raise RunNotFoundError(run_id)
+
+    def list_runs(self, limit: int = 50, offset: int = 0) -> list[Run]:
+        """运行列表：有 store 时以持久层为准（跨重启），否则退回内存倒序。"""
+        if self.store:
+            return self.store.list_runs(limit=limit, offset=offset)
+        ordered = sorted(
+            self._runs.values(), key=lambda r: (r.created_at, r.id), reverse=True
+        )
+        return ordered[offset : offset + limit]
 
     def result(self, run_id: str) -> WritingState | None:
         """运行成功后的终态 WritingState；未完成或失败时为 None。"""
         return self._results.get(run_id)
+
+    def _persist(self, run: Run) -> None:
+        if self.store:
+            self.store.upsert_run(run)
 
     # ---- 执行 ----
 
@@ -83,6 +104,7 @@ class JobRunner:
     async def _execute(self, run: Run, executor: RunExecutor, output_dir: str) -> None:
         try:
             run.transition(RunStatus.RUNNING)
+            self._persist(run)
             await self._emit(run, EventStatus.STARTED)
             state = await executor.execute(
                 topic=run.topic,
@@ -92,6 +114,7 @@ class JobRunner:
             )
             self._results[run.id] = state
             run.transition(RunStatus.COMPLETED)
+            self._persist(run)
             await self._emit(
                 run,
                 EventStatus.COMPLETED,
@@ -103,12 +126,14 @@ class JobRunner:
         except asyncio.CancelledError:
             run.error = "任务被取消"
             run.transition(RunStatus.CANCELLED)
+            self._persist(run)
             await self._emit(run, EventStatus.FAILED, payload={"error": "cancelled"})
             raise
         except Exception as exc:  # 作业边界：任何异常都转为 FAILED 终态
             logger.exception("run %s 执行失败", run.id)
             run.error = str(exc)
             run.transition(RunStatus.FAILED)
+            self._persist(run)
             await self._emit(
                 run,
                 EventStatus.FAILED,
@@ -121,7 +146,7 @@ class JobRunner:
     async def _emit(
         self, run: Run, status: EventStatus, payload: dict[str, Any] | None = None
     ) -> RunEvent:
-        return await self.bus.emit(
+        event = await self.bus.emit(
             run.id,
             kind=SpanKind.RUN,
             name="writing",
@@ -129,6 +154,11 @@ class JobRunner:
             span_id=f"run_{run.id}",
             payload=payload,
         )
+        # 事件双写：SQLite 是事实来源（重启后可回放），总线只负责实时分发。
+        # 同步写 SQLite 在微秒级，不值得为此引入异步驱动
+        if self.store:
+            self.store.save_event(event)
+        return event
 
     async def wait(self, run_id: str) -> None:
         """等待后台任务结束（测试与优雅停机用）。"""

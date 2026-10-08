@@ -5,6 +5,7 @@ from httpx import ASGITransport, AsyncClient
 from api.app import create_app
 from api.bus import TraceBus
 from api.runner import JobRunner
+from api.store import RunStore
 from src.state import WritingState
 
 
@@ -147,3 +148,40 @@ async def test_healthz():
     resp = await client.get("/healthz")
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok"}
+
+
+# --------------------------------------------------------------------------
+# M2-2：SQLite 事实来源——服务重启后数据仍在
+# --------------------------------------------------------------------------
+
+
+async def test_runs_survive_service_restart(tmp_path):
+    """重启模拟：完成一次运行后，用同一 db 文件装配全新的 bus/runner/app，
+    历史运行的列表、详情与事件历史都必须可见。"""
+    db_path = tmp_path / "zylo.db"
+
+    bus1 = TraceBus()
+    runner1 = JobRunner(bus1, store=RunStore(db_path))
+    app1 = create_app(bus=bus1, runner=runner1, executor_factory=StubExecutor)
+    async with AsyncClient(transport=ASGITransport(app=app1), base_url="http://t1") as c1:
+        created = (await c1.post("/api/runs", json={"topic": "重启幸存者"})).json()
+        await runner1.wait(created["id"])
+        assert (await c1.get(f"/api/runs/{created['id']}")).json()["status"] == "completed"
+
+    # 全新进程的内存状态：只有同一个 SQLite 文件
+    bus2 = TraceBus()
+    runner2 = JobRunner(bus2, store=RunStore(db_path))
+    app2 = create_app(bus=bus2, runner=runner2, executor_factory=StubExecutor)
+    async with AsyncClient(transport=ASGITransport(app=app2), base_url="http://t2") as c2:
+        listing = (await c2.get("/api/runs")).json()
+        assert [item["id"] for item in listing["items"]] == [created["id"]]
+
+        detail = (await c2.get(f"/api/runs/{created['id']}")).json()
+        assert detail["status"] == "completed"
+        assert detail["topic"] == "重启幸存者"
+
+        # 事件历史可从 SQLite 回放（即使内存总线里没有这个 run）
+        store2 = RunStore(db_path)
+        events = store2.get_events(created["id"])
+        assert [e.sequence for e in events] == [1, 2]
+        assert events[-1].status.value == "completed"
