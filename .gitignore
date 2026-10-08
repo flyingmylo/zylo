@@ -27,6 +27,9 @@ env/
 venv/
 ENV/
 
+# Web 工作台依赖（dist/ 已被上方全局规则覆盖）
+web/node_modules/
+
 # Environment Variables & Secrets (CRITICAL)
 .env
 .env.local
