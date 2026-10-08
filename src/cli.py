@@ -8,6 +8,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from src.embeddings.base import EmbeddingProvider
 from src.llm.config import LLMConfig
 from src.llm.openai_provider import OpenAICompatibleProvider
 from src.orchestrator import WritingOrchestrator
@@ -268,6 +269,81 @@ def write(
 
 
 @app.command(
+    name="serve",
+    help="🌐 启动 API 服务（--mock 为离线演示模式，无需任何 API Key 与本地模型）",
+)
+def serve(
+    mock: Annotated[
+        bool,
+        typer.Option(
+            "--mock",
+            help="离线演示模式：Mock LLM + 固定向量嵌入，不访问网络不产生费用",
+        ),
+    ] = False,
+    host: Annotated[str, typer.Option("--host", help="监听地址")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", help="监听端口")] = 8000,
+):
+    # 装配放函数内：不把 fastapi/uvicorn 的导入成本强加给 write/check 等命令
+    import uvicorn
+
+    from api.app import create_app
+    from api.bus import TraceBus
+    from api.runner import JobRunner
+
+    config = LLMConfig()
+    # 嵌入模型权重 2GB：真实模式下进程内只加载一次，跨 run 复用
+    shared: dict[str, EmbeddingProvider] = {}
+
+    def make_executor() -> WritingOrchestrator:
+        if mock:
+            from src.embeddings.dummy import DummyEmbeddingProvider
+            from src.llm.mock import MockLLMProvider
+
+            # 每次运行一个新 Mock 实例：审稿轮次状态按 run 隔离
+            return WritingOrchestrator(
+                llm=MockLLMProvider(),
+                embedding_provider=DummyEmbeddingProvider(),
+            )
+
+        if not config.api_key or not config.model:
+            console.print(
+                "[bold red]❌ 真实模式需要 LLM_API_KEY 与 LLM_MODEL；"
+                "离线体验请加 --mock[/bold red]"
+            )
+            raise typer.Exit(code=1)
+
+        if "embedding" not in shared:
+            from src.embeddings.bge_provider import BGEM3EmbeddingProvider
+
+            console.print("[bold cyan]🔹 正在载入 BAAI/bge-m3 嵌入模型...[/bold cyan]")
+            shared["embedding"] = BGEM3EmbeddingProvider()
+
+        return WritingOrchestrator(
+            llm=OpenAICompatibleProvider(
+                api_key=config.api_key, model=config.model, base_url=config.base_url
+            ),
+            embedding_provider=shared["embedding"],
+            tavily_api_key=config.tavily_api_key or None,
+        )
+
+    bus = TraceBus()
+    app = create_app(bus=bus, runner=JobRunner(bus), executor_factory=make_executor)
+
+    mode_desc = "[green]Mock 离线演示[/green]" if mock else "[yellow]真实模型[/yellow]"
+    console.print(
+        Panel.fit(
+            f"🪶 zylo API 服务\n"
+            f"⚡ 模式: {mode_desc}\n"
+            f"🌐 地址: [cyan]http://{host}:{port}[/cyan]\n"
+            f"📡 事件流: [cyan]http://{host}:{port}/api/runs/{{run_id}}/events[/cyan]",
+            title="[bold green]服务就绪[/bold green]",
+            border_style="cyan",
+        )
+    )
+    uvicorn.run(app, host=host, port=port)
+
+
+@app.command(
     name="check",
     help="🔍 诊断本机硬件加速 (Metal MPS) 与环境变量状态",
 )
@@ -367,7 +443,7 @@ def show_config():
 
 def main():
     # 智能快捷注入 (Q2-A)：若直接输入 zylo "主题" 或仅输入 zylo，自动映射为 write 命令
-    subcommands = {"check", "config", "write"}
+    subcommands = {"check", "config", "serve", "write"}
     raw_args = sys.argv[1:]
     if raw_args:
         first = raw_args[0]
