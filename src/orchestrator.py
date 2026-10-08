@@ -126,9 +126,7 @@ class WritingOrchestrator:
                     state.full_draft = best_snapshot["full_draft"]
                     state.review_passed = best_snapshot["review_passed"]
                     state.critiques = best_snapshot["critiques"]
-                    state.actionable_revisions = best_snapshot[
-                        "actionable_revisions"
-                    ]
+                    state.actionable_revisions = best_snapshot["actionable_revisions"]
                     state.selected_revision = best_snapshot["round"]
                     best_round_desc = (
                         "初稿"
@@ -178,7 +176,7 @@ total_words: {len(state.full_draft)}
 ### 审稿与生成元信息
 - **综合质检评分**: `{state.review_score:.1f} / 100`
 - **反思修订轮次**: `{state.revision_count}`
-- **最终采用版本**: `{'初稿' if state.selected_revision == 0 else f'第 {state.selected_revision} 轮修改稿'}`
+- **最终采用版本**: `{"初稿" if state.selected_revision == 0 else f"第 {state.selected_revision} 轮修改稿"}`
 - **Token 消耗统计**: `Prompt: {state.token_usage.get("prompt_tokens", 0)} | Completion: {state.token_usage.get("completion_tokens", 0)} | Total: {state.token_usage.get("total_tokens", 0)}`
 """
         return header + state.full_draft + footer
