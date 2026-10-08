@@ -16,6 +16,8 @@ dependencies = [
     "rich>=13.7.0",
     "python-dotenv>=1.0.0",
     "pydantic>=2.7.0",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
     "typer>=0.12.0"
@@ -40,7 +42,10 @@ filterwarnings = [
 ]
 
 # pyright 语言服务器据此用项目根 .venv 解析第三方导入，
-# 相对路径写法在项目搬迁/venv 重建后依然成立
+# 相对路径写法在项目搬迁/venv 重建后依然成立。
+# Zed 内置的 basedpyright 默认档位 recommended 噪音过大，降到 standard
+# （与普通 pyright 对齐）：保留真实类型错误，关闭 Any 传播等风格提醒
 [tool.pyright]
+typeCheckingMode = "standard"
 venvPath = "."
 venv = ".venv"
