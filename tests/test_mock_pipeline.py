@@ -1,0 +1,125 @@
+import json
+
+from api.bus import TraceBus
+from api.runner import JobRunner
+from src.embeddings.dummy import DummyEmbeddingProvider
+from src.llm.base import LLMProvider, LLMResponse
+from src.llm.mock import MOCK_USAGE, MockLLMProvider
+from src.orchestrator import WritingOrchestrator
+from src.runs import RunStatus
+
+
+async def _chat(provider: LLMProvider, system: str, user: str = "") -> LLMResponse:
+    return await provider.chat(
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+    )
+
+
+# --------------------------------------------------------------------------
+# Mock Provider 角色分派
+# --------------------------------------------------------------------------
+
+
+async def test_mock_provider_dispatches_by_role():
+    provider = MockLLMProvider()
+
+    keywords = await _chat(provider, "你是一位技术调研员。请生成检索词", "技术主题: MoE 路由")
+    assert json.loads(keywords.content) == ["MoE 路由 核心原理", "MoE 路由 生产实践"]
+
+    summary = await _chat(provider, "你是一位严谨资深的技术调研专家。")
+    assert "调研综述" in summary.content
+
+    outline = await _chat(provider, "你是一位顶级技术布道师与架构规划专家。", "【写作主题】：MoE")
+    data = json.loads(outline.content)
+    assert data["outline_title"] == "MoE 深度解析"
+    assert len(data["sections"]) == 3
+
+    writing = await _chat(
+        provider, "你是一位卓越的中文技术作家", "【当前撰写小节】：一、背景"
+    )
+    assert "一、背景" in writing.content
+    assert "KV-Cache" in writing.content
+
+
+async def test_mock_review_two_round_semantics():
+    """首轮审稿不通过并给修订意见，次轮通过——演示反思回路的最小剧本。"""
+    provider = MockLLMProvider()
+
+    first = await _chat(provider, "你是一位极其挑剔的技术审稿专家")
+    data1 = json.loads(first.content)
+    assert data1["passed"] is False and data1["score"] < 85
+    assert data1["actionable_revisions"]
+
+    second = await _chat(provider, "你是一位极其挑剔的技术审稿专家")
+    data2 = json.loads(second.content)
+    assert data2["passed"] is True and data2["score"] >= 85
+
+
+async def test_mock_provider_reports_fake_usage():
+    provider = MockLLMProvider()
+    resp = await _chat(provider, "任意系统提示")
+    assert resp.usage == MOCK_USAGE
+
+
+def test_dummy_embedding_is_deterministic():
+    provider = DummyEmbeddingProvider()
+
+    v1 = provider.embed_query("KV-Cache")
+    v2 = provider.embed_query("KV-Cache")
+    v3 = provider.embed_query("完全不同的文本")
+
+    assert v1 == v2
+    assert v1 != v3
+    assert len(v1) == DummyEmbeddingProvider.DIM
+    assert len(provider.embed_documents(["a", "b"])) == 2
+
+
+# --------------------------------------------------------------------------
+# 真实 Orchestrator 的离线全链路（Mock LLM + Dummy 嵌入，不触网不花钱）
+# --------------------------------------------------------------------------
+
+
+async def test_full_pipeline_offline_with_real_orchestrator(tmp_path):
+    bus = TraceBus()
+    runner = JobRunner(bus)
+
+    def make_executor() -> WritingOrchestrator:
+        return WritingOrchestrator(
+            llm=MockLLMProvider(),
+            embedding_provider=DummyEmbeddingProvider(),
+        )
+
+    run = runner.create("MoE 路由机制")
+    runner.launch(run.id, make_executor(), output_dir=str(tmp_path))
+    await runner.wait(run.id)
+
+    # 运行完成，且真实经历了"首轮不通过 → 修订 → 通过"的反思回路
+    assert run.status is RunStatus.COMPLETED
+    state = runner.result(run.id)
+    assert state is not None
+    assert state.revision_count == 1
+    assert state.review_score == 92.0
+    assert state.outline_title == "MoE 路由机制 深度解析"
+
+    # 终稿内容与产物文件
+    assert "MoE 路由机制 深度解析" in state.final_markdown
+    articles = list(tmp_path.glob("*.md"))
+    assert len(articles) == 1
+
+    # Token 统计有数：全链路共 10 次 Mock 调用（tavily 未配置，
+    # 检索词生成一并跳过）：综述1 + 规划1 + 初稿3 + 审稿1 + 修订3 + 审稿1
+    assert state.token_usage["total_tokens"] == MOCK_USAGE["total_tokens"] * 10
+
+    # 事件流可完整回放
+    sub = bus.subscribe(run.id)
+    events = []
+    while not sub._queue.empty():
+        item = sub._queue.get_nowait()
+        if item is not None and hasattr(item, "status"):
+            events.append(item)
+    assert events[0].status.value == "started"
+    assert events[-1].status.value == "completed"
+    assert events[-1].payload["total_tokens"] == state.token_usage["total_tokens"]
