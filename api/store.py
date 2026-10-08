@@ -11,10 +11,11 @@
 
 import json
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
 from src.events import RunEvent
-from src.runs import Run
+from src.runs import Run, RunStatus
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -42,6 +43,18 @@ CREATE TABLE IF NOT EXISTS run_events (
     created_at    TEXT NOT NULL,
     PRIMARY KEY (run_id, sequence)
 );
+
+CREATE TABLE IF NOT EXISTS state_snapshots (
+    run_id         TEXT NOT NULL REFERENCES runs(id),
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    stage          TEXT NOT NULL,
+    state_json     TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    created_at     TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_state_snapshots_run
+    ON state_snapshots(run_id, id);
 """
 
 
@@ -103,12 +116,20 @@ class RunStore:
             "SELECT * FROM runs ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             (limit, offset),
         ).fetchall()
-        runs = []
-        for row in rows:
-            data = dict(row)
-            data["config"] = json.loads(data.pop("config_json"))
-            runs.append(Run.model_validate(data))
-        return runs
+        return [self._row_to_run(row) for row in rows]
+
+    def runs_in_status(self, status: RunStatus) -> list[Run]:
+        """按状态过滤（服务启动时扫描遗留 running 的恢复入口）。"""
+        rows = self._conn.execute(
+            "SELECT * FROM runs WHERE status = ? ORDER BY created_at ASC",
+            (status.value,),
+        ).fetchall()
+        return [self._row_to_run(row) for row in rows]
+
+    def _row_to_run(self, row: sqlite3.Row) -> Run:
+        data = dict(row)
+        data["config"] = json.loads(data.pop("config_json"))
+        return Run.model_validate(data)
 
     # ---- run_events ----
 
@@ -151,6 +172,38 @@ class RunStore:
             data["payload"] = json.loads(data.pop("payload_json"))
             events.append(RunEvent.model_validate(data))
         return events
+
+    # ---- state_snapshots ----
+
+    def save_state_snapshot(self, run_id: str, stage: str, state_payload: dict) -> None:
+        """追加一条阶段快照；只增不改，resume 取最新一条即可。"""
+        self._conn.execute(
+            """
+            INSERT INTO state_snapshots (run_id, stage, state_json, schema_version, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                stage,
+                json.dumps(state_payload, ensure_ascii=False),
+                state_payload.get("schema_version", 1),
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+        self._conn.commit()
+
+    def latest_state_snapshot(self, run_id: str) -> dict | None:
+        """最新快照的完整载荷（含 schema_version）；无快照返回 None。"""
+        row = self._conn.execute(
+            """
+            SELECT state_json FROM state_snapshots WHERE run_id = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["state_json"])
 
     # ---- 生命周期 ----
 
