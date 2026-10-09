@@ -291,7 +291,7 @@ def serve(
     import uvicorn
 
     from api.app import create_app
-    from api.bus import TraceBus
+    from api.bus import TraceBus, TraceEmitter
     from api.runner import JobRunner
     from api.store import RunStore
 
@@ -312,6 +312,7 @@ def serve(
                 embedding_provider=DummyEmbeddingProvider(),
                 kb_persist_dir=f"data/chroma/{run.id}",
                 budget=BudgetGuard.from_env(),
+                trace=TraceEmitter(bus, run.id),
             )
 
         if not config.api_key or not config.model:
@@ -335,9 +336,11 @@ def serve(
             tavily_api_key=config.tavily_api_key or None,
             kb_persist_dir=f"data/chroma/{run.id}",
             budget=BudgetGuard.from_env(),
+            trace=TraceEmitter(bus, run.id),
         )
 
-    # SQLite 事实来源：重启后运行列表、详情与事件历史仍可查询
+    # SQLite 事实来源：重启后运行列表、详情与事件历史仍可查询。
+    # bus 挂载 store 后所有 emit 自动双写（实时广播 + 落盘）
     store = RunStore("data/zylo.db")
 
     # 启动恢复：上一个进程遗留的 RUNNING 已无宿主任务，落位 PARTIAL，
@@ -350,7 +353,7 @@ def serve(
             f"已转为 PARTIAL，可用 zylo resume {stale.id} 续跑[/yellow]"
         )
 
-    bus = TraceBus()
+    bus = TraceBus(store=store)
     app = create_app(bus=bus, runner=JobRunner(bus, store), executor_factory=make_executor)
 
     mode_desc = "[green]Mock 离线演示[/green]" if mock else "[yellow]真实模型[/yellow]"
@@ -414,6 +417,10 @@ def resume_cmd(
     console.print("[bold cyan]🔹 正在载入 BAAI/bge-m3 嵌入模型...[/bold cyan]")
     embedding = BGEM3EmbeddingProvider()
 
+    from api.bus import TraceBus, TraceEmitter
+
+    resume_bus = TraceBus(store=store)
+
     def on_checkpoint(state) -> None:
         store.save_state_snapshot(run_id, state.current_stage.value, serialize_state(state))
 
@@ -435,6 +442,7 @@ def resume_cmd(
             progress_callback=progress,
             kb_persist_dir=f"data/chroma/{run.id}",
             budget=BudgetGuard.from_env(),
+            trace=TraceEmitter(resume_bus, run.id),
         ).execute(
             topic=run.topic,
             output_dir=output_dir,

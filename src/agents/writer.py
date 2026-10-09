@@ -1,4 +1,5 @@
 from src.budget import BudgetGuard
+from src.events import RunTrace
 from src.llm.base import LLMProvider
 from src.prompts import WRITER_SYSTEM_PROMPT
 from src.state import Stage, WritingState
@@ -20,9 +21,14 @@ class WriterAgent(BaseAgent):
         llm: LLMProvider,
         knowledge_base: AgentKnowledgeBase,
         budget: BudgetGuard | None = None,
+        trace: RunTrace | None = None,
     ):
         super().__init__(
-            name="Writer", llm=llm, system_prompt=WRITER_SYSTEM_PROMPT, budget=budget
+            name="Writer",
+            llm=llm,
+            system_prompt=WRITER_SYSTEM_PROMPT,
+            budget=budget,
+            trace=trace,
         )
         self.kb = knowledge_base
 

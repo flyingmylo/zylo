@@ -1,4 +1,5 @@
 from src.budget import BudgetGuard
+from src.events import RunTrace
 from src.llm.base import LLMProvider
 from src.prompts import REVIEWER_SYSTEM_PROMPT
 from src.schemas import ReviewReport, StructuredOutputError
@@ -16,9 +17,18 @@ class ReviewerAgent(BaseAgent):
        经 Pydantic 严格校验 + section 取值域校验，失败带错误重试一次
     """
 
-    def __init__(self, llm: LLMProvider, budget: BudgetGuard | None = None):
+    def __init__(
+        self,
+        llm: LLMProvider,
+        budget: BudgetGuard | None = None,
+        trace: RunTrace | None = None,
+    ):
         super().__init__(
-            name="Reviewer", llm=llm, system_prompt=REVIEWER_SYSTEM_PROMPT, budget=budget
+            name="Reviewer",
+            llm=llm,
+            system_prompt=REVIEWER_SYSTEM_PROMPT,
+            budget=budget,
+            trace=trace,
         )
 
     async def run(self, state: WritingState) -> WritingState:

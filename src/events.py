@@ -7,7 +7,7 @@
 import json
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Protocol
 
 from pydantic import BaseModel, Field
 
@@ -74,6 +74,50 @@ def sanitize_payload(value: Any) -> Any:
     if isinstance(value, str) and len(value) > MAX_PAYLOAD_STRING:
         return value[:MAX_PAYLOAD_STRING] + f"...[truncated {len(value)} chars]"
     return value
+
+
+class RunTrace(Protocol):
+    """运行时事件发射器的最小契约（五层 span：run/stage/agent/llm/tool）。
+
+    放在 src 层使 Agent 依赖抽象而非 api 层实现；具体实现见
+    api.bus.TraceEmitter（总线+落盘），无观测需求时用 NullTrace。
+    """
+
+    def start_span(
+        self,
+        kind: SpanKind,
+        name: str,
+        parent_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> str: ...
+
+    def finish_span(
+        self,
+        span_id: str,
+        status: EventStatus = EventStatus.COMPLETED,
+        payload: dict[str, Any] | None = None,
+    ) -> None: ...
+
+
+class NullTrace:
+    """零开销空实现：未注入观测时 Agent 代码路径完全无感。"""
+
+    def start_span(
+        self,
+        kind: SpanKind,
+        name: str,
+        parent_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> str:
+        return ""
+
+    def finish_span(
+        self,
+        span_id: str,
+        status: EventStatus = EventStatus.COMPLETED,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        return None
 
 
 class RunEvent(BaseModel):

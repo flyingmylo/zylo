@@ -9,6 +9,7 @@ from typing import Any, Protocol, TypeVar
 from pydantic import BaseModel, ValidationError
 
 from src.budget import BudgetGuard
+from src.events import EventStatus, NullTrace, RunTrace, SpanKind
 from src.llm.base import LLMProvider, LLMResponse
 from src.schemas import StructuredOutputError
 from src.state import WritingState
@@ -72,6 +73,7 @@ class BaseAgent(ABC):
         system_prompt: str,
         tools: list[Tool] | None = None,
         budget: BudgetGuard | None = None,
+        trace: RunTrace | None = None,
     ):
         self.name = name
         self.llm = llm
@@ -79,6 +81,10 @@ class BaseAgent(ABC):
         self.logger = logging.getLogger(f"src.agents.{name}")
         # 同一 run 的全部 Agent 共享同一个 BudgetGuard 实例（由编排器注入）
         self.budget = budget
+        # 未注入观测时用零开销空实现，Agent 代码路径完全无感
+        self.trace = trace or NullTrace()
+        # 编排器在包 agent.run 时写入当前 agent span，供 llm/tool 事件挂父节点
+        self.current_span_id: str | None = None
 
         # 以 LLM 侧的函数名为键建立分发表。schema 在建表时深拷贝快照，
         # 使「向模型宣告的工具」与「能调度的实现」不会因事后修改而分裂。
@@ -220,10 +226,23 @@ class BaseAgent(ABC):
         """
         if self.budget:
             self.budget.check_before_call()
-        resp = await self.llm.chat(
-            messages=messages,
-            tools=tools,
-            temperature=temperature,
+        llm_span = self.trace.start_span(
+            SpanKind.LLM, self._llm_name(), parent_id=self.current_span_id
+        )
+        try:
+            resp = await self.llm.chat(
+                messages=messages,
+                tools=tools,
+                temperature=temperature,
+            )
+        except Exception as exc:
+            self.trace.finish_span(
+                llm_span, EventStatus.FAILED, payload={"error": f"{type(exc).__name__}: {exc}"}
+            )
+            raise
+        usage_payload = dict(resp.usage) if resp.usage else {}
+        self.trace.finish_span(
+            llm_span, EventStatus.COMPLETED, payload=usage_payload
         )
         if resp.usage:
             if self.budget:
@@ -231,6 +250,10 @@ class BaseAgent(ABC):
             for k, v in resp.usage.items():
                 state.token_usage[k] = state.token_usage.get(k, 0) + v
         return resp
+
+    def _llm_name(self) -> str:
+        """LLM 事件的展示名：优先 provider 的 model 属性，退回类名。"""
+        return str(getattr(self.llm, "model", type(self.llm).__name__))
 
     async def _execute_tool(self, name: str, args_json: str) -> str:
         """执行单个工具并返回文本结果。
@@ -241,12 +264,24 @@ class BaseAgent(ABC):
         tool = self._tool_map.get(name)
         if not tool:
             return f"Error: Tool '{name}' not found."
+        tool_span = self.trace.start_span(
+            SpanKind.TOOL, name, parent_id=self.current_span_id
+        )
         try:
             kwargs = json.loads(args_json) if args_json else {}
             res = await tool.execute(**kwargs)
-            return json.dumps(res, ensure_ascii=False)
+            result_text = json.dumps(res, ensure_ascii=False)
+            self.trace.finish_span(
+                tool_span, EventStatus.COMPLETED, payload={"result_chars": len(result_text)}
+            )
+            return result_text
         except Exception as e:
             self.logger.exception("工具 '%s' 执行失败", name)
+            self.trace.finish_span(
+                tool_span,
+                EventStatus.FAILED,
+                payload={"error": f"{type(e).__name__}: {e}"},
+            )
             return f"Error executing tool '{name}': {type(e).__name__}：{e!s}"
 
     async def _chat_with_tools(

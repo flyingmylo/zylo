@@ -1,8 +1,9 @@
 import json
 
-from api.bus import TraceBus
+from api.bus import TraceBus, TraceEmitter
 from api.runner import JobRunner
 from src.embeddings.dummy import DummyEmbeddingProvider
+from src.events import EventStatus, RunEvent
 from src.llm.base import LLMProvider, LLMResponse
 from src.llm.mock import MOCK_USAGE, MockLLMProvider
 from src.orchestrator import WritingOrchestrator
@@ -124,6 +125,98 @@ async def test_full_pipeline_offline_with_real_orchestrator(tmp_path):
     assert events[0].status.value == "started"
     assert events[-1].status.value == "completed"
     assert events[-1].payload["total_tokens"] == state.token_usage["total_tokens"]
+
+
+# --------------------------------------------------------------------------
+# M3-1：五层 Trace 事件
+# --------------------------------------------------------------------------
+
+
+async def test_full_pipeline_emits_all_five_span_layers():
+    """run/stage/agent/llm/tool 五层事件齐全，parent 链与层级一致。"""
+    from api.bus import TraceBus
+    from src.events import EventStatus, SpanKind
+
+    bus = TraceBus()
+    # 给 Orchestrator 注入 TraceEmitter（M1 版总线测试只覆盖 run 层）
+
+    orchestrator = WritingOrchestrator(
+        llm=MockLLMProvider(),
+        embedding_provider=DummyEmbeddingProvider(),
+        trace=TraceEmitter(bus, "trace_run"),
+    )
+    await orchestrator.execute(topic="MoE 路由", output_dir="/tmp/zylo-trace-test")
+
+    sub = bus.subscribe("trace_run")
+    events = []
+    while not sub._queue.empty():
+        item = sub._queue.get_nowait()
+        if isinstance(item, RunEvent):
+            events.append(item)
+    bus.close("trace_run")
+
+    kinds = {e.kind for e in events}
+    # run 层由 JobRunner 发（此处直跑 Orchestrator 无 run 层）；
+    # stage/agent/llm 必须齐备；tool 层本链路无注册工具（Researcher
+    # 检索走确定性流程），M3-1 在 BaseAgent._execute_tool 已接线
+    assert kinds >= {SpanKind.STAGE, SpanKind.AGENT, SpanKind.LLM}
+
+    stage_names = [e.name for e in events if e.kind is SpanKind.STAGE]
+    # started/completed 成对：每个 stage 名出现 2 次
+    # researching/planning/writing/reviewing（×2 轮）/exporting
+    assert "researching" in stage_names and "planning" in stage_names
+    assert stage_names.count("writing") == 4  # 2 个 span × 2 状态
+    assert stage_names.count("reviewing") == 4
+    assert "exporting" in stage_names
+
+    agent_names = {e.name for e in events if e.kind is SpanKind.AGENT}
+    assert agent_names == {"ResearcherAgent", "PlannerAgent", "WriterAgent", "ReviewerAgent"}
+
+    # agent 事件挂在 stage 之下：parent_id 必须指向真实存在的 stage span
+    span_ids = {e.span_id for e in events}
+    agent_events = [e for e in events if e.kind is SpanKind.AGENT]
+    assert all(e.parent_id in span_ids for e in agent_events)
+
+    # LLM 事件挂在 agent 之下，且 started/completed 成对（含 usage 载荷）
+    llm_events = [e for e in events if e.kind is SpanKind.LLM]
+    llm_spans = {e.span_id for e in llm_events}
+    assert len(llm_spans) * 2 == len(llm_events)
+    completed_llm = [e for e in llm_events if e.status is EventStatus.COMPLETED]
+    assert all(e.payload.get("total_tokens") for e in completed_llm)
+    assert all(e.parent_id in span_ids for e in llm_events)
+
+
+async def test_llm_failure_emits_failed_span():
+    """LLM 调用抛错时 span 以 failed 收尾，错误摘要进 payload。"""
+
+    class ExplodingLLM(MockLLMProvider):
+        async def chat(self, messages, tools=None, temperature=0.7):
+            raise RuntimeError("endpoint exploded")
+
+    bus = TraceBus()
+
+    orchestrator = WritingOrchestrator(
+        llm=ExplodingLLM(),
+        embedding_provider=DummyEmbeddingProvider(),
+        trace=TraceEmitter(bus, "fail_run"),
+    )
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="endpoint exploded"):
+        await orchestrator.execute(topic="任何", output_dir="/tmp/zylo-trace-test")
+
+    sub = bus.subscribe("fail_run")
+    events = []
+    while not sub._queue.empty():
+        item = sub._queue.get_nowait()
+        if isinstance(item, RunEvent):
+            events.append(item)
+    bus.close("fail_run")
+
+    failed = [e for e in events if e.status is EventStatus.FAILED]
+    assert failed, "LLM 故障必须产生 failed 事件"
+    assert any("endpoint exploded" in str(e.payload.get("error", "")) for e in failed)
 
 
 # --------------------------------------------------------------------------

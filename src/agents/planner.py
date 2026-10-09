@@ -1,4 +1,5 @@
 from src.budget import BudgetGuard
+from src.events import RunTrace
 from src.llm.base import LLMProvider
 from src.prompts import PLANNER_SYSTEM_PROMPT
 from src.schemas import PlannerOutline, StructuredOutputError
@@ -14,9 +15,18 @@ class PlannerAgent(BaseAgent):
     关键职责：为每一个章节分别精准生成中英双语的向量检索关键词（retrieval_query_zh & retrieval_query_en）
     """
 
-    def __init__(self, llm: LLMProvider, budget: BudgetGuard | None = None):
+    def __init__(
+        self,
+        llm: LLMProvider,
+        budget: BudgetGuard | None = None,
+        trace: RunTrace | None = None,
+    ):
         super().__init__(
-            name="Planner", llm=llm, system_prompt=PLANNER_SYSTEM_PROMPT, budget=budget
+            name="Planner",
+            llm=llm,
+            system_prompt=PLANNER_SYSTEM_PROMPT,
+            budget=budget,
+            trace=trace,
         )
 
     async def run(self, state: WritingState) -> WritingState:

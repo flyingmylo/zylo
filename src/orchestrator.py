@@ -4,6 +4,7 @@ from collections.abc import Callable
 from copy import deepcopy
 from datetime import UTC, datetime
 
+from src.agents.base import BaseAgent
 from src.agents.planner import PlannerAgent
 from src.agents.researcher import ResearcherAgent
 from src.agents.reviewer import ReviewerAgent
@@ -11,6 +12,7 @@ from src.agents.writer import WriterAgent
 from src.budget import BudgetGuard
 from src.embeddings.base import EmbeddingProvider
 from src.embeddings.reranker_base import RerankerProvider
+from src.events import EventStatus, NullTrace, RunTrace, SpanKind
 from src.llm.base import LLMProvider
 from src.state import Stage, WritingState
 from src.tools.knowledge_base import KnowledgeBase
@@ -32,6 +34,7 @@ class WritingOrchestrator:
         progress_callback: Callable[[str, WritingState], None] | None = None,
         kb_persist_dir: str | None = None,
         budget: BudgetGuard | None = None,
+        trace: RunTrace | None = None,
     ):
         self.llm = llm
         self.embedding = embedding_provider
@@ -43,6 +46,38 @@ class WritingOrchestrator:
         # 无预算时也挂一个无上限 guard：照常记账（calls/tokens/cost），
         # 只是永不熔断；同一 run 的全部 Agent 共享此实例
         self.budget = budget or BudgetGuard()
+        # 五层 Trace 的发射器（run 层由 JobRunner 负责，此处发
+        # stage/agent 两层；llm/tool 在 BaseAgent 内发射）
+        self.trace = trace or NullTrace()
+
+    async def _run_agent(
+        self, agent: BaseAgent, state: WritingState, parent_id: str | None = None
+    ) -> WritingState:
+        """以 agent span 包裹一次 agent.run，异常也落 failed 事件后上抛。
+
+        parent_id 是所属 stage 的 span：stage → agent → llm/tool 三层
+        父子链由此建立（前端按 parent_id 还原调用树）。
+        """
+        span = self.trace.start_span(
+            SpanKind.AGENT, type(agent).__name__, parent_id=parent_id
+        )
+        agent.current_span_id = span
+        try:
+            state = await agent.run(state)
+        except Exception as exc:
+            self.trace.finish_span(
+                span,
+                EventStatus.FAILED,
+                payload={"error": f"{type(exc).__name__}: {exc}"},
+            )
+            raise
+        finally:
+            agent.current_span_id = None
+        self.trace.finish_span(span, EventStatus.COMPLETED)
+        return state
+
+    def _stage_span(self, name: str, payload: dict | None = None) -> str:
+        return self.trace.start_span(SpanKind.STAGE, name, payload=payload)
 
     async def execute(
         self,
@@ -88,11 +123,15 @@ class WritingOrchestrator:
             SearchTool(api_key=self.tavily_api_key) if self.tavily_api_key else None
         )
         researcher = ResearcherAgent(
-            self.llm, knowledge_base=kb, search_tool=search_tool, budget=self.budget
+            self.llm,
+            knowledge_base=kb,
+            search_tool=search_tool,
+            budget=self.budget,
+            trace=self.trace,
         )
-        planner = PlannerAgent(self.llm, budget=self.budget)
-        writer = WriterAgent(self.llm, knowledge_base=kb, budget=self.budget)
-        reviewer = ReviewerAgent(self.llm, budget=self.budget)
+        planner = PlannerAgent(self.llm, budget=self.budget, trace=self.trace)
+        writer = WriterAgent(self.llm, knowledge_base=kb, budget=self.budget, trace=self.trace)
+        reviewer = ReviewerAgent(self.llm, budget=self.budget, trace=self.trace)
 
         def completed(stage: Stage) -> bool:
             """该阶段是否已在快照中完成（Stage 枚举定义序即执行序）。"""
@@ -104,7 +143,9 @@ class WritingOrchestrator:
             self.on_progress(
                 "🔍 启动 Researcher 进行文献解析、网络检索与知识库构建...", state
             )
-            state = await researcher.run(state)
+            stage = self._stage_span("researching")
+            state = await self._run_agent(researcher, state, parent_id=stage)
+            self.trace.finish_span(stage, EventStatus.COMPLETED, payload={"chunks": kb.count()})
             self.on_progress(f"✅ 调研完成，入库向量片段 {kb.count()} 条。", state)
         else:
             self.on_progress("⏭️ 快照显示调研已完成，跳过 Researcher。", state)
@@ -113,7 +154,11 @@ class WritingOrchestrator:
         # ====== 阶段 2: 大纲规划 ======
         if not completed(Stage.PLANNING):
             self.on_progress("📐 启动 Planner 制定深度技术架构大纲与双语检索词...", state)
-            state = await planner.run(state)
+            stage = self._stage_span("planning")
+            state = await self._run_agent(planner, state, parent_id=stage)
+            self.trace.finish_span(
+                stage, EventStatus.COMPLETED, payload={"sections": len(state.sections)}
+            )
             self.on_progress(
                 f"✅ 大纲制定完毕，共 {len(state.sections)} 个深度章节。", state
             )
@@ -130,12 +175,24 @@ class WritingOrchestrator:
                 else f"第 {state.revision_count} 轮定向修改"
             )
             self.on_progress(f"✍️ 启动 Writer 执行小节向量检索与{round_desc}...", state)
-            state = await writer.run(state)
+            write_stage = self._stage_span(
+                "writing", payload={"round": state.revision_count}
+            )
+            state = await self._run_agent(writer, state, parent_id=write_stage)
+            self.trace.finish_span(write_stage, EventStatus.COMPLETED)
 
             self.on_progress(
                 "🧐 启动 Reviewer 审查技术事实、专业术语与行文逻辑...", state
             )
-            state = await reviewer.run(state)
+            review_stage = self._stage_span(
+                "reviewing", payload={"round": state.revision_count}
+            )
+            state = await self._run_agent(reviewer, state, parent_id=review_stage)
+            self.trace.finish_span(
+                review_stage,
+                EventStatus.COMPLETED,
+                payload={"score": state.review_score, "passed": state.review_passed},
+            )
 
             self.on_progress(
                 f"📊 审稿得分: {state.review_score:.1f}/100 | 是否通过: {state.review_passed}",
@@ -199,9 +256,11 @@ class WritingOrchestrator:
             )
 
         # ====== 阶段 5: 定稿与导出 ======
+        export_stage = self._stage_span("exporting")
         state.current_stage = Stage.COMPLETED
         state.final_markdown = self._format_final_markdown(state)
         self._export_to_file(state, output_dir=output_dir)
+        self.trace.finish_span(export_stage, EventStatus.COMPLETED)
         self.on_progress("🚀 文章已生成并成功导出至 output 目录！", state)
         checkpoint(state)
 

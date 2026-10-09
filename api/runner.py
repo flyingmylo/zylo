@@ -120,7 +120,7 @@ class JobRunner:
         try:
             run.transition(RunStatus.RUNNING)
             self._persist(run)
-            await self._emit(run, EventStatus.STARTED)
+            self._emit(run, EventStatus.STARTED)
             state = await executor.execute(
                 topic=run.topic,
                 local_files=run.config.get("sources"),
@@ -131,7 +131,7 @@ class JobRunner:
             self._results[run.id] = state
             run.transition(RunStatus.COMPLETED)
             self._persist(run)
-            await self._emit(
+            self._emit(
                 run,
                 EventStatus.COMPLETED,
                 payload={
@@ -143,7 +143,7 @@ class JobRunner:
             run.error = "任务被取消"
             run.transition(RunStatus.CANCELLED)
             self._persist(run)
-            await self._emit(run, EventStatus.FAILED, payload={"error": "cancelled"})
+            self._emit(run, EventStatus.FAILED, payload={"error": "cancelled"})
             raise
         except BudgetExceededError as exc:
             # 预算耗尽是"资源不足"而非"执行出错"：落位 PARTIAL，
@@ -152,7 +152,7 @@ class JobRunner:
             run.error = f"预算耗尽：{exc}"
             run.transition(RunStatus.PARTIAL)
             self._persist(run)
-            await self._emit(
+            self._emit(
                 run,
                 EventStatus.FAILED,
                 payload={"error": f"budget_exceeded: {exc}"},
@@ -162,7 +162,7 @@ class JobRunner:
             run.error = str(exc)
             run.transition(RunStatus.FAILED)
             self._persist(run)
-            await self._emit(
+            self._emit(
                 run,
                 EventStatus.FAILED,
                 payload={"error": f"{type(exc).__name__}: {exc}"},
@@ -171,10 +171,12 @@ class JobRunner:
             # 无论成败都终结订阅流，SSE 客户端据此收尾
             self.bus.close(run.id)
 
-    async def _emit(
+    def _emit(
         self, run: Run, status: EventStatus, payload: dict[str, Any] | None = None
     ) -> RunEvent:
-        event = await self.bus.emit(
+        # 落盘由 bus 挂载的 store 自动完成（emit 内统一双写），
+        # 这里只负责 run 层事件本身
+        return self.bus.emit(
             run.id,
             kind=SpanKind.RUN,
             name="writing",
@@ -182,11 +184,6 @@ class JobRunner:
             span_id=f"run_{run.id}",
             payload=payload,
         )
-        # 事件双写：SQLite 是事实来源（重启后可回放），总线只负责实时分发。
-        # 同步写 SQLite 在微秒级，不值得为此引入异步驱动
-        if self.store:
-            self.store.save_event(event)
-        return event
 
     async def wait(self, run_id: str) -> None:
         """等待后台任务结束（测试与优雅停机用）。"""

@@ -3,6 +3,7 @@ from collections import defaultdict
 from typing import TypedDict
 
 from src.budget import BudgetGuard
+from src.events import RunTrace
 from src.llm.base import LLMProvider
 from src.prompts import RESEARCHER_SYSTEM_PROMPT
 from src.state import Stage, WritingState
@@ -41,12 +42,14 @@ class ResearcherAgent(BaseAgent):
         knowledge_base: AgentKnowledgeBase,
         search_tool: AgentSearchTool | None = None,
         budget: BudgetGuard | None = None,
+        trace: RunTrace | None = None,
     ):
         super().__init__(
             name="Researcher",
             llm=llm,
             system_prompt=RESEARCHER_SYSTEM_PROMPT,
             budget=budget,
+            trace=trace,
         )
         self.kb = knowledge_base
         self.doc_reader = DocumentReader()

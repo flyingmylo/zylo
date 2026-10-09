@@ -168,7 +168,8 @@ async def test_runs_survive_service_restart(tmp_path):
     历史运行的列表、详情与事件历史都必须可见。"""
     db_path = tmp_path / "zylo.db"
 
-    bus1 = TraceBus()
+    # bus 挂载 store：事件在 emit 内统一双写（实时广播 + 落盘）
+    bus1 = TraceBus(store=RunStore(db_path))
     runner1 = JobRunner(bus1, store=RunStore(db_path))
     app1 = create_app(bus=bus1, runner=runner1, executor_factory=lambda run: StubExecutor())
     async with AsyncClient(transport=ASGITransport(app=app1), base_url="http://t1") as c1:
