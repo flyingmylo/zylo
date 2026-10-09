@@ -1,7 +1,9 @@
 import asyncio
 
 from api.bus import TraceBus
+from api.store import RunStore
 from src.events import EventStatus, RunEvent, SpanKind
+from src.runs import Run, RunStatus
 
 
 def _emit(bus: TraceBus, run_id: str, name: str, **kwargs) -> RunEvent:
@@ -127,3 +129,54 @@ async def _drain(sub):
     async for event in sub:
         events.append(event)
     return events
+
+
+# --------------------------------------------------------------------------
+# M3-2：SQLite 事实来源——序号续接与跨进程回放
+# --------------------------------------------------------------------------
+
+
+def _seed_run(store: RunStore, run_id: str, status: RunStatus) -> None:
+    """FK 约束要求 run_events 的 run_id 先在 runs 表落位。"""
+    store.upsert_run(Run(id=run_id, topic="t", status=status))
+
+
+async def test_new_bus_continues_sequence_from_sqlite(tmp_path):
+    """回归（resume 覆盖 bug）：新 bus 实例不得从 1 重计序号。
+
+    修复前 resume 换新 bus 后，事件按 (run_id, sequence) 主键 REPLACE
+    掉第一轮的同序号事件，历史时间线被篡改。
+    """
+    store = RunStore(tmp_path / "zylo.db")
+    _seed_run(store, "run_r", RunStatus.PARTIAL)
+    bus1 = TraceBus(store=store)
+    for i in range(3):
+        _emit(bus1, "run_r", f"e{i}")
+
+    # resume 场景：换一个全新 bus（内存计数器为空），只有同一个 SQLite 文件
+    bus2 = TraceBus(store=store)
+    resumed = _emit(bus2, "run_r", "resumed")
+
+    assert resumed.sequence == 4
+    assert [e.name for e in store.get_events("run_r")] == ["e0", "e1", "e2", "resumed"]
+
+
+async def test_subscribe_replays_from_sqlite_and_ends_for_stopped_run(tmp_path):
+    """跨进程回放：新 bus 对已停摆 run 订阅，历史来自 SQLite 且流正常终结。
+
+    修复前新 bus 的内存缓冲与 _closed 都是空的：回放为空 + 永不终结，
+    SSE 客户端既看不到历史又无限挂死。
+    """
+    store = RunStore(tmp_path / "zylo.db")
+    _seed_run(store, "run_x", RunStatus.PARTIAL)
+    bus1 = TraceBus(store=store)
+    _emit(bus1, "run_x", "e1")
+    _emit(bus1, "run_x", "e2")
+
+    # 全新进程视角：内存一无所知，只有同一个 SQLite 文件
+    bus2 = TraceBus(store=store)
+    sub = bus2.subscribe("run_x", after_sequence=0)
+    # _drain 能在 timeout 内返回本身就证明流正常终结（挂死会超时失败）
+    received = await asyncio.wait_for(_drain(sub), timeout=1)
+
+    assert [e.sequence for e in received] == [1, 2]

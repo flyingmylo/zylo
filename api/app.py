@@ -94,9 +94,13 @@ def create_app(
         bus: TraceBus = request.app.state.bus
         runner_: JobRunner = request.app.state.runner
         runner_.get(run_id)  # 404 校验
-        # SSE 断线重连标准头优先，query 参数作显式覆盖
+        # SSE 断线重连标准头优先，query 参数作显式覆盖；
+        # 畸形 last-event-id 不按 500 处理，回退到 query 参数的回放起点
         last_event_id = request.headers.get("last-event-id")
-        after_sequence = int(last_event_id) if last_event_id else after
+        try:
+            after_sequence = int(last_event_id) if last_event_id else after
+        except ValueError:
+            after_sequence = after
         subscription = bus.subscribe(run_id, after_sequence=after_sequence)
 
         async def event_stream():

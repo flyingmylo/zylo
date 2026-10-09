@@ -194,3 +194,65 @@ async def test_runs_survive_service_restart(tmp_path):
         events = store2.get_events(created["id"])
         assert [e.sequence for e in events] == [1, 2]
         assert events[-1].status.value == "completed"
+
+
+# --------------------------------------------------------------------------
+# M3-2：SSE 历史回放接 SQLite——断线重连跨进程可续
+# --------------------------------------------------------------------------
+
+
+def _sse_ids(text: str) -> list[int]:
+    """从 SSE 响应体提取全部事件 id（= sequence）。"""
+    return [
+        int(line.split(": ")[1])
+        for line in text.splitlines()
+        if line.startswith("id: ")
+    ]
+
+
+async def test_sse_replay_after_restart_with_last_event_id(tmp_path):
+    """重启后带 Last-Event-ID 重连：增量历史从 SQLite 回放，流正常终结。
+
+    修复前新进程的内存缓冲与 _closed 都是空的——客户端收不到历史，
+    且因为 run 已终结、永远不会有人 close，连接无限挂死。
+    """
+    db_path = tmp_path / "zylo.db"
+    store1 = RunStore(db_path)
+    bus1 = TraceBus(store=store1)
+    runner1 = JobRunner(bus1, store=store1)
+    app1 = create_app(bus=bus1, runner=runner1, executor_factory=lambda run: StubExecutor())
+    async with AsyncClient(transport=ASGITransport(app=app1), base_url="http://t1") as c1:
+        created = (await c1.post("/api/runs", json={"topic": "断线重连"})).json()
+        await runner1.wait(created["id"])
+        first = await c1.get(f"/api/runs/{created['id']}/events")
+        total = max(_sse_ids(first.text))
+
+    # 全新进程的内存状态：只有同一个 SQLite 文件；模拟客户端已收到 total-1 条
+    store2 = RunStore(db_path)
+    bus2 = TraceBus(store=store2)
+    runner2 = JobRunner(bus2, store=store2)
+    app2 = create_app(bus=bus2, runner=runner2, executor_factory=lambda run: StubExecutor())
+    async with AsyncClient(transport=ASGITransport(app=app2), base_url="http://t2") as c2:
+        resp = await c2.get(
+            f"/api/runs/{created['id']}/events",
+            headers={"last-event-id": str(total - 1)},
+        )
+        assert resp.status_code == 200
+        # 增量恰好一条、无重复；请求正常返回本身证明流已终结（挂死会读超时）
+        assert _sse_ids(resp.text) == [total]
+
+
+async def test_sse_malformed_last_event_id_falls_back_to_full_replay():
+    """畸形 last-event-id 不触发 500，按无回放起点全量回放。"""
+    client, runner = _make_client()
+
+    created = (await client.post("/api/runs", json={"topic": "畸形头"})).json()
+    await runner.wait(created["id"])
+
+    resp = await client.get(
+        f"/api/runs/{created['id']}/events",
+        headers={"last-event-id": "not-a-number"},
+    )
+
+    assert resp.status_code == 200
+    assert _sse_ids(resp.text)[0] == 1

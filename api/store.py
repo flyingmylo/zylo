@@ -157,6 +157,18 @@ class RunStore:
         )
         self._conn.commit()
 
+    def last_sequence(self, run_id: str) -> int | None:
+        """该 run 已落盘的最大 sequence；无事件返回 None。
+
+        resume 换新 bus 实例时，内存计数器归零，必须以此续接序号，
+        否则 (run_id, sequence) 主键会把第一轮事件 REPLACE 覆盖。
+        """
+        row = self._conn.execute(
+            "SELECT MAX(sequence) AS max_seq FROM run_events WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        return row["max_seq"] if row is not None else None
+
     def get_events(self, run_id: str, after_sequence: int = 0) -> list[RunEvent]:
         """按 sequence 升序返回事件，供 SSE 历史回放与 resume 重建上下文。"""
         rows = self._conn.execute(

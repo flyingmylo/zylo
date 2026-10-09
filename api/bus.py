@@ -18,6 +18,7 @@ from src.events import (
     SpanKind,
     sanitize_payload,
 )
+from src.runs import RunStatus
 
 if TYPE_CHECKING:
     from api.store import RunStore
@@ -78,7 +79,7 @@ class TraceBus:
         sanitize_payload，保证脱敏规则只有一处实现。
         """
         event = RunEvent(
-            sequence=self._next_sequence.setdefault(run_id, 1),
+            sequence=self._base_sequence(run_id),
             run_id=run_id,
             kind=kind,
             name=name,
@@ -100,22 +101,60 @@ class TraceBus:
             self._store.save_event(event)
         return event
 
+    def _base_sequence(self, run_id: str) -> int:
+        """该 run 的下一个 sequence：内存计数器优先，首次见到该 run 时
+        以 SQLite 已落盘的最大序号续接。
+
+        resume 场景的 bus 是全新实例，若计数器从 1 重计，落盘会按
+        (run_id, sequence) 主键 REPLACE 掉第一轮的同序号事件——历史被篡改。
+        """
+        if run_id in self._next_sequence:
+            return self._next_sequence[run_id]
+        last = self._store.last_sequence(run_id) if self._store else None
+        self._next_sequence[run_id] = last + 1 if last is not None else 1
+        return self._next_sequence[run_id]
+
     def subscribe(self, run_id: str, after_sequence: int = 0) -> Subscription:
         """订阅某 run 的事件；先回放 sequence 之后的历史，再接续实时流。
 
-        「登记订阅者 + 回放历史」在同一个无 await 的同步段内完成，
-        而 emit 也全程同步，两者天然互斥，不存在回放与实时之间的缝隙。
+        回放的事实来源是 SQLite（挂载 store 时，ADR-002）：跨进程重连与
+        内存缓冲溢出都由它兜底；未挂 store 的纯内存用法退回内存缓冲。
+        「登记订阅者 + 回放历史」与 emit 同为无 await 的同步方法，
+        单线程事件循环里天然互斥，回放与实时流之间不存在缝隙。
         """
         queue: asyncio.Queue[RunEvent | object] = asyncio.Queue()
         subscribers = self._subscribers.setdefault(run_id, [])
         subscribers.append(queue)
-        for event in self._history.get(run_id, deque()):
-            if event.sequence > after_sequence:
-                queue.put_nowait(event)
-        # 流已终结的 run：回放完历史后立即结束，否则 SSE 客户端会永远等待
-        if run_id in self._closed:
+        if self._store is not None:
+            replay = self._store.get_events(run_id, after_sequence)
+        else:
+            replay = [
+                e
+                for e in self._history.get(run_id, ())
+                if e.sequence > after_sequence
+            ]
+        for event in replay:
+            queue.put_nowait(event)
+        if self._stream_ended(run_id):
             queue.put_nowait(_CLOSE_SENTINEL)
         return Subscription(queue)
+
+    def _stream_ended(self, run_id: str) -> bool:
+        """本次订阅是否应在回放后立即终结。
+
+        两种情况：本进程 close 过该 run；或 SQLite 里 run 已落入终态/PARTIAL
+        ——跨进程视角（服务重启后 _closed 为空），只能靠持久化状态判断。
+        PARTIAL 也视为流终结：当前执行已停摆，resume 追加的新事件由客户端
+        下次带 Last-Event-ID 重连时从 SQLite 增量拉取。
+        """
+        if run_id in self._closed:
+            return True
+        if self._store is None:
+            return False
+        run = self._store.get_run(run_id)
+        return run is not None and (
+            run.status.is_terminal or run.status is RunStatus.PARTIAL
+        )
 
     def unsubscribe(self, run_id: str, subscription: Subscription) -> None:
         """移除订阅者；SSE 连接断开时必须调用，避免队列滞留。"""
