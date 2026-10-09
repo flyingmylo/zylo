@@ -61,10 +61,12 @@ _ALLOWED_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
         }
     ),
     RunStatus.WAITING_FOR_HUMAN_REVIEW: frozenset(
-        {RunStatus.REVISING, RunStatus.COMPLETED, RunStatus.CANCELLED}
+        # RUNNING：人已决策，注入 state 后恢复执行（M3-3 决策恢复路径）
+        {RunStatus.REVISING, RunStatus.RUNNING, RunStatus.COMPLETED, RunStatus.CANCELLED}
     ),
     RunStatus.REVISING: frozenset(
         {
+            RunStatus.RUNNING,
             RunStatus.WAITING_FOR_HUMAN_REVIEW,
             RunStatus.COMPLETED,
             RunStatus.FAILED,

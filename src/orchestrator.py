@@ -19,6 +19,19 @@ from src.tools.knowledge_base import KnowledgeBase
 from src.tools.search import SearchTool
 
 
+class HumanReviewRequired(Exception):
+    """human_review 开启时，每轮审稿完成后抛出以暂停执行（M3-3）。
+
+    携带停点 state：JobRunner 据此把 run 落位 WAITING_FOR_HUMAN_REVIEW
+    并保留内存引用（快照已由 checkpoint 先行落盘，跨进程可从快照恢复）。
+    人工决策注入 state 后经 resume_state 重入 execute 续跑。
+    """
+
+    def __init__(self, state: WritingState) -> None:
+        super().__init__("等待人工审稿决策")
+        self.state = state
+
+
 class WritingOrchestrator:
     """
     中央写作编排器：
@@ -35,6 +48,7 @@ class WritingOrchestrator:
         kb_persist_dir: str | None = None,
         budget: BudgetGuard | None = None,
         trace: RunTrace | None = None,
+        human_review: bool = False,
     ):
         self.llm = llm
         self.embedding = embedding_provider
@@ -49,6 +63,9 @@ class WritingOrchestrator:
         # 五层 Trace 的发射器（run 层由 JobRunner 负责，此处发
         # stage/agent 两层；llm/tool 在 BaseAgent 内发射）
         self.trace = trace or NullTrace()
+        # 人审开关：开启后每轮审稿完成即暂停（抛 HumanReviewRequired），
+        # 由上层落位 WAITING_FOR_HUMAN_REVIEW 并等待 POST /review-decisions
+        self.human_review = human_review
 
     async def _run_agent(
         self, agent: BaseAgent, state: WritingState, parent_id: str | None = None
@@ -169,91 +186,86 @@ class WritingOrchestrator:
         # ====== 阶段 3 & 4: 写作与审稿反思回路 ======
         best_snapshot: dict | None = None
         while state.revision_count <= state.max_revisions:
-            round_desc = (
-                "初稿撰写"
-                if state.revision_count == 0
-                else f"第 {state.revision_count} 轮定向修改"
-            )
-            self.on_progress(f"✍️ 启动 Writer 执行小节向量检索与{round_desc}...", state)
-            write_stage = self._stage_span(
-                "writing", payload={"round": state.revision_count}
-            )
-            state = await self._run_agent(writer, state, parent_id=write_stage)
-            self.trace.finish_span(write_stage, EventStatus.COMPLETED)
-
-            self.on_progress(
-                "🧐 启动 Reviewer 审查技术事实、专业术语与行文逻辑...", state
-            )
-            review_stage = self._stage_span(
-                "reviewing", payload={"round": state.revision_count}
-            )
-            state = await self._run_agent(reviewer, state, parent_id=review_stage)
-            self.trace.finish_span(
-                review_stage,
-                EventStatus.COMPLETED,
-                payload={"score": state.review_score, "passed": state.review_passed},
-            )
-
-            self.on_progress(
-                f"📊 审稿得分: {state.review_score:.1f}/100 | 是否通过: {state.review_passed}",
-                state,
-            )
-
-            # 记录历史最优稿：审稿无单调保证，强制定稿时回填最优轮，
-            # 避免「最后一轮」覆盖「最好一轮」
-            if best_snapshot is None or state.review_score > best_snapshot["score"]:
-                best_snapshot = {
-                    "round": state.revision_count,
-                    "score": state.review_score,
-                    "section_drafts": dict(state.section_drafts),
-                    "full_draft": state.full_draft,
-                    "review_passed": state.review_passed,
-                    "critiques": list(state.critiques),
-                    "actionable_revisions": deepcopy(state.actionable_revisions),
-                }
-
-            # 审稿完成为最细粒度快照点：resume 自此重入修订轮，
-            # 已生成正文都在 section_drafts 里，重写仅限被点名小节
-            checkpoint(state)
-
-            if state.review_passed:
-                state.selected_revision = state.revision_count
-                self.on_progress("🎉 审稿通过，符合发布质量！", state)
-                break
-
-            if state.revision_count >= state.max_revisions:
-                if best_snapshot["score"] > state.review_score:
-                    state.review_score = best_snapshot["score"]
-                    state.section_drafts = best_snapshot["section_drafts"]
-                    state.full_draft = best_snapshot["full_draft"]
-                    state.review_passed = best_snapshot["review_passed"]
-                    state.critiques = best_snapshot["critiques"]
-                    state.actionable_revisions = best_snapshot["actionable_revisions"]
-                    state.selected_revision = best_snapshot["round"]
-                    best_round_desc = (
-                        "初稿"
-                        if best_snapshot["round"] == 0
-                        else f"第 {best_snapshot['round']} 轮修改稿"
-                    )
-                    self.on_progress(
-                        f"🏅 当前终稿非历史最优，已回退保留{best_round_desc}"
-                        f"（{best_snapshot['score']:.1f} 分）...",
-                        state,
-                    )
-                else:
+            # 人审决策重入（M3-3）：停点快照恢复时本轮写作/审稿均已完成，
+            # 决策结果已注入 state（意见过滤 / 拍板置 passed），直接消费——
+            # 跳过 Writer/Reviewer，避免重复扣费
+            if state.awaiting_human:
+                state.awaiting_human = False
+                if state.review_passed:
                     state.selected_revision = state.revision_count
+                    self.on_progress("✅ 人工决策：拍板定稿。", state)
+                    break
+                if state.revision_count >= state.max_revisions:
+                    # 人刚逐条决策过，当前稿就是人的选择，不回退历史最优
+                    state.selected_revision = state.revision_count
+                    self.on_progress(
+                        "⚠️ 人工决策后已达最大轮次，按当前稿定稿。", state
+                    )
+                    break
+                state.revision_count += 1
                 self.on_progress(
-                    f"⚠️ 已达到最大修改轮次 ({state.max_revisions} 轮)，强制定稿。",
+                    f"👤 人工决策已注入，进入第 {state.revision_count} 轮定向修改...",
                     state,
                 )
-                break
+            else:
+                round_desc = (
+                    "初稿撰写"
+                    if state.revision_count == 0
+                    else f"第 {state.revision_count} 轮定向修改"
+                )
+                self.on_progress(f"✍️ 启动 Writer 执行小节向量检索与{round_desc}...", state)
+                write_stage = self._stage_span(
+                    "writing", payload={"round": state.revision_count}
+                )
+                state = await self._run_agent(writer, state, parent_id=write_stage)
+                self.trace.finish_span(write_stage, EventStatus.COMPLETED)
 
-            state.revision_count += 1
+                self.on_progress(
+                    "🧐 启动 Reviewer 审查技术事实、专业术语与行文逻辑...", state
+                )
+                review_stage = self._stage_span(
+                    "reviewing", payload={"round": state.revision_count}
+                )
+                state = await self._run_agent(reviewer, state, parent_id=review_stage)
+                self.trace.finish_span(
+                    review_stage,
+                    EventStatus.COMPLETED,
+                    payload={"score": state.review_score, "passed": state.review_passed},
+                )
 
-            self.on_progress(
-                f"🔄 审稿未通过，存在 {len(state.actionable_revisions)} 处待改进项，进入下一轮迭代...",
-                state,
-            )
+                self.on_progress(
+                    f"📊 审稿得分: {state.review_score:.1f}/100 | 是否通过: {state.review_passed}",
+                    state,
+                )
+
+                # 记录历史最优稿：审稿无单调保证，强制定稿时回填最优轮，
+                # 避免「最后一轮」覆盖「最好一轮」
+                if best_snapshot is None or state.review_score > best_snapshot["score"]:
+                    best_snapshot = {
+                        "round": state.revision_count,
+                        "score": state.review_score,
+                        "section_drafts": dict(state.section_drafts),
+                        "full_draft": state.full_draft,
+                        "review_passed": state.review_passed,
+                        "critiques": list(state.critiques),
+                        "actionable_revisions": deepcopy(state.actionable_revisions),
+                    }
+
+                # 审稿完成为最细粒度快照点：resume 自此重入修订轮，
+                # 已生成正文都在 section_drafts 里，重写仅限被点名小节
+                checkpoint(state)
+
+                # 人审停点：审稿完成后不自动继续，state 与快照均已就绪，
+                # 等待 POST /review-decisions 注入决策后续跑
+                if self.human_review:
+                    state.awaiting_human = True
+                    checkpoint(state)
+                    self.on_progress("⏸️ 审稿完成，等待人工决策...", state)
+                    raise HumanReviewRequired(state)
+
+                if self._advance_after_review(state, best_snapshot):
+                    break
+                state.revision_count += 1
 
         # ====== 阶段 5: 定稿与导出 ======
         export_stage = self._stage_span("exporting")
@@ -265,6 +277,55 @@ class WritingOrchestrator:
         checkpoint(state)
 
         return state
+
+    def _advance_after_review(
+        self, state: WritingState, best_snapshot: dict | None
+    ) -> bool:
+        """自动路径（人审关闭）的审稿后推进决策：返回 True 表示定稿退出回路。
+
+        - 审稿通过：当前轮即定稿；
+        - 达到最大轮次：回退历史最优稿定稿；
+        - 否则返回 False，由调用方进入下一轮修订。
+        """
+        if state.review_passed:
+            state.selected_revision = state.revision_count
+            self.on_progress("🎉 审稿通过，符合发布质量！", state)
+            return True
+
+        if state.revision_count >= state.max_revisions:
+            # best_snapshot 为 None：resume 重入后本进程尚未记录过最优稿，
+            # 当前稿是唯一候选（原实现此处直接下标访问会 TypeError）
+            if best_snapshot is not None and best_snapshot["score"] > state.review_score:
+                state.review_score = best_snapshot["score"]
+                state.section_drafts = best_snapshot["section_drafts"]
+                state.full_draft = best_snapshot["full_draft"]
+                state.review_passed = best_snapshot["review_passed"]
+                state.critiques = best_snapshot["critiques"]
+                state.actionable_revisions = best_snapshot["actionable_revisions"]
+                state.selected_revision = best_snapshot["round"]
+                best_round_desc = (
+                    "初稿"
+                    if best_snapshot["round"] == 0
+                    else f"第 {best_snapshot['round']} 轮修改稿"
+                )
+                self.on_progress(
+                    f"🏅 当前终稿非历史最优，已回退保留{best_round_desc}"
+                    f"（{best_snapshot['score']:.1f} 分）...",
+                    state,
+                )
+            else:
+                state.selected_revision = state.revision_count
+            self.on_progress(
+                f"⚠️ 已达到最大修改轮次 ({state.max_revisions} 轮)，强制定稿。",
+                state,
+            )
+            return True
+
+        self.on_progress(
+            f"🔄 审稿未通过，存在 {len(state.actionable_revisions)} 处待改进项，进入下一轮迭代...",
+            state,
+        )
+        return False
 
     def _format_final_markdown(self, state: WritingState) -> str:
         header = f"""---

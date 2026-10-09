@@ -1,3 +1,5 @@
+from uuid import uuid4
+
 from src.budget import BudgetGuard
 from src.events import RunTrace
 from src.llm.base import LLMProvider
@@ -75,8 +77,14 @@ actionable_revisions 中每条 section 字段只允许取以下值之一（逐�
         state.review_score = report.score
         state.review_passed = report.passed
         state.critiques = report.critiques
+        # critique_id 是人工决策的定位锚点：POST /review-decisions 按 ID
+        # 逐条处置（采纳/拒绝/修改），降级路径无意见故无需生成
         state.actionable_revisions = [
-            {"section": rev.section, "advice": rev.advice}
+            {
+                "critique_id": uuid4().hex[:8],
+                "section": rev.section,
+                "advice": rev.advice,
+            }
             for rev in report.actionable_revisions
         ]
         return state

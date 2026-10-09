@@ -50,6 +50,9 @@ class EventStatus(str, Enum):
     STARTED = "started"
     COMPLETED = "completed"
     FAILED = "failed"
+    # 仅 run 层使用：人审停点（状态机进入 waiting_for_human_review）；
+    # span 不产生该值——stage/agent/llm/tool 只有起止成败语义
+    WAITING = "waiting"
 
 
 def sanitize_payload(value: Any) -> Any:

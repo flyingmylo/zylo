@@ -256,10 +256,13 @@ async def test_reviewer_legacy_string_revisions_rejected_then_accepted_on_retry(
 
     state = await ReviewerAgent(llm).run(state)
 
-    assert state.actionable_revisions == [
+    # critique_id 是人工决策的定位锚点，剥离随机 ID 后比较；ID 需非空且不重复
+    assert _revisions_without_ids(state.actionable_revisions) == [
         {"section": "一、核心原理", "advice": "请增加双语对照。"},
         {"section": "全局", "advice": "语言整体更自然。"},
     ]
+    ids = [rev["critique_id"] for rev in state.actionable_revisions]
+    assert all(ids) and len(set(ids)) == len(ids)
     assert state.errors == []
 
 
@@ -299,8 +302,8 @@ async def test_reviewer_fuzzy_scope_normalized_and_unknown_retried():
 
     state = await ReviewerAgent(llm).run(state)
 
-    # 最终所有意见都精确落位，没有静默全局化
-    assert state.actionable_revisions == [
+    # 最终所有意见都精确落位，没有静默全局化（剥离随机 critique_id 后比较）
+    assert _revisions_without_ids(state.actionable_revisions) == [
         {"section": "一、核心原理", "advice": "补充公式推导"},
         {"section": "二、实践", "advice": "调整详略"},
     ]
@@ -943,6 +946,11 @@ def _review_json(revisions) -> str:
     )
 
 
+def _revisions_without_ids(revisions: list[dict]) -> list[dict]:
+    """剥离 Reviewer 生成的随机 critique_id 后比较（ID 是人工决策锚点，值不参与断言）。"""
+    return [{k: v for k, v in rev.items() if k != "critique_id"} for rev in revisions]
+
+
 @pytest.mark.asyncio
 async def test_reviewer_parses_structured_revisions():
     llm = ScriptedLLM(
@@ -964,7 +972,7 @@ async def test_reviewer_parses_structured_revisions():
 
     assert state.review_score == 78.5
     assert state.review_passed is False
-    assert state.actionable_revisions == [
+    assert _revisions_without_ids(state.actionable_revisions) == [
         {"section": "一、原理", "advice": "补充显存对比数据"},
         {"section": "全局", "advice": "统一术语双语对照"},
     ]
@@ -989,7 +997,7 @@ async def test_reviewer_preserves_explicit_global_scope_when_advice_names_sectio
     )
     state = await ReviewerAgent(llm).run(_review_state(["一、原理", "二、实践"]))
 
-    assert state.actionable_revisions == [
+    assert _revisions_without_ids(state.actionable_revisions) == [
         {
             "section": "全局",
             "advice": "统一一、原理与二、实践之间的术语表达",

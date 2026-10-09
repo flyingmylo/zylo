@@ -57,6 +57,10 @@ class WritingState:
     revision_count: int = 0
     max_revisions: int = 2
     selected_revision: int = 0  # 最终导出采用的版本轮次，0 表示初稿
+    # 人审停点标志（M3-3）：True 表示本轮审稿已完成、正等待人工决策，
+    # resume 重入编排器时据此跳过已完成的写作/审稿直接消费决策结果。
+    # 带默认值的新字段对旧快照向后兼容，无需递增 SNAPSHOT_SCHEMA_VERSION
+    awaiting_human: bool = False
 
     # 终稿与日志
     final_markdown: str = ""
