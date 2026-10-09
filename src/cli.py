@@ -105,12 +105,15 @@ async def _run_write_async(
     def progress_logger(message: str, state: WritingState):
         console.print(f"[dim]{message}[/dim]")
 
+    from src.budget import BudgetGuard
+
     orchestrator = WritingOrchestrator(
         llm=llm_provider,
         embedding_provider=embedding_provider,
         reranker_provider=reranker_provider,
         tavily_api_key=config.tavily_api_key,
         progress_callback=progress_logger,
+        budget=BudgetGuard.from_env(),
     )
 
     state = await orchestrator.execute(
@@ -297,6 +300,8 @@ def serve(
     shared: dict[str, EmbeddingProvider] = {}
 
     def make_executor(run) -> WritingOrchestrator:
+        from src.budget import BudgetGuard
+
         if mock:
             from src.embeddings.dummy import DummyEmbeddingProvider
             from src.llm.mock import MockLLMProvider
@@ -306,6 +311,7 @@ def serve(
                 llm=MockLLMProvider(),
                 embedding_provider=DummyEmbeddingProvider(),
                 kb_persist_dir=f"data/chroma/{run.id}",
+                budget=BudgetGuard.from_env(),
             )
 
         if not config.api_key or not config.model:
@@ -328,6 +334,7 @@ def serve(
             embedding_provider=shared["embedding"],
             tavily_api_key=config.tavily_api_key or None,
             kb_persist_dir=f"data/chroma/{run.id}",
+            budget=BudgetGuard.from_env(),
         )
 
     # SQLite 事实来源：重启后运行列表、详情与事件历史仍可查询
@@ -417,6 +424,8 @@ def resume_cmd(
     store.upsert_run(run)
 
     async def _run() -> WritingState:
+        from src.budget import BudgetGuard
+
         return await WritingOrchestrator(
             llm=OpenAICompatibleProvider(
                 api_key=config.api_key, model=config.model, base_url=config.base_url
@@ -425,6 +434,7 @@ def resume_cmd(
             tavily_api_key=config.tavily_api_key or None,
             progress_callback=progress,
             kb_persist_dir=f"data/chroma/{run.id}",
+            budget=BudgetGuard.from_env(),
         ).execute(
             topic=run.topic,
             output_dir=output_dir,

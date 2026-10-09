@@ -1,3 +1,4 @@
+from src.budget import BudgetGuard
 from src.llm.base import LLMProvider
 from src.prompts import WRITER_SYSTEM_PROMPT
 from src.state import Stage, WritingState
@@ -14,8 +15,15 @@ class WriterAgent(BaseAgent):
     4. 修订轮在上一版正文基础上定向重写被点名的小节，未点名小节原样保留
     """
 
-    def __init__(self, llm: LLMProvider, knowledge_base: AgentKnowledgeBase):
-        super().__init__(name="Writer", llm=llm, system_prompt=WRITER_SYSTEM_PROMPT)
+    def __init__(
+        self,
+        llm: LLMProvider,
+        knowledge_base: AgentKnowledgeBase,
+        budget: BudgetGuard | None = None,
+    ):
+        super().__init__(
+            name="Writer", llm=llm, system_prompt=WRITER_SYSTEM_PROMPT, budget=budget
+        )
         self.kb = knowledge_base
 
     async def run(self, state: WritingState) -> WritingState:

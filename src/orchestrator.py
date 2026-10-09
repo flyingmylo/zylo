@@ -8,6 +8,7 @@ from src.agents.planner import PlannerAgent
 from src.agents.researcher import ResearcherAgent
 from src.agents.reviewer import ReviewerAgent
 from src.agents.writer import WriterAgent
+from src.budget import BudgetGuard
 from src.embeddings.base import EmbeddingProvider
 from src.embeddings.reranker_base import RerankerProvider
 from src.llm.base import LLMProvider
@@ -30,6 +31,7 @@ class WritingOrchestrator:
         tavily_api_key: str | None = None,
         progress_callback: Callable[[str, WritingState], None] | None = None,
         kb_persist_dir: str | None = None,
+        budget: BudgetGuard | None = None,
     ):
         self.llm = llm
         self.embedding = embedding_provider
@@ -38,6 +40,9 @@ class WritingOrchestrator:
         self.on_progress = progress_callback or (lambda msg, state: None)
         # None = 进程内内存库；指定目录则向量落盘且 resume 可恢复检索
         self.kb_persist_dir = kb_persist_dir
+        # 无预算时也挂一个无上限 guard：照常记账（calls/tokens/cost），
+        # 只是永不熔断；同一 run 的全部 Agent 共享此实例
+        self.budget = budget or BudgetGuard()
 
     async def execute(
         self,
@@ -83,11 +88,11 @@ class WritingOrchestrator:
             SearchTool(api_key=self.tavily_api_key) if self.tavily_api_key else None
         )
         researcher = ResearcherAgent(
-            self.llm, knowledge_base=kb, search_tool=search_tool
+            self.llm, knowledge_base=kb, search_tool=search_tool, budget=self.budget
         )
-        planner = PlannerAgent(self.llm)
-        writer = WriterAgent(self.llm, knowledge_base=kb)
-        reviewer = ReviewerAgent(self.llm)
+        planner = PlannerAgent(self.llm, budget=self.budget)
+        writer = WriterAgent(self.llm, knowledge_base=kb, budget=self.budget)
+        reviewer = ReviewerAgent(self.llm, budget=self.budget)
 
         def completed(stage: Stage) -> bool:
             """该阶段是否已在快照中完成（Stage 枚举定义序即执行序）。"""

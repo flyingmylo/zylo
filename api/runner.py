@@ -11,6 +11,7 @@ from typing import Any, Protocol
 
 from api.bus import TraceBus
 from api.store import RunStore
+from src.budget import BudgetExceededError
 from src.events import EventStatus, RunEvent, SpanKind
 from src.runs import Run, RunStatus
 from src.state import WritingState, serialize_state
@@ -144,6 +145,18 @@ class JobRunner:
             self._persist(run)
             await self._emit(run, EventStatus.FAILED, payload={"error": "cancelled"})
             raise
+        except BudgetExceededError as exc:
+            # 预算耗尽是"资源不足"而非"执行出错"：落位 PARTIAL，
+            # 快照已保留，调大预算后 zylo resume 即可续跑
+            logger.warning("run %s 预算耗尽：%s", run.id, exc)
+            run.error = f"预算耗尽：{exc}"
+            run.transition(RunStatus.PARTIAL)
+            self._persist(run)
+            await self._emit(
+                run,
+                EventStatus.FAILED,
+                payload={"error": f"budget_exceeded: {exc}"},
+            )
         except Exception as exc:  # 作业边界：任何异常都转为 FAILED 终态
             logger.exception("run %s 执行失败", run.id)
             run.error = str(exc)

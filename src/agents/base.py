@@ -5,6 +5,7 @@ import re
 from abc import ABC, abstractmethod
 from typing import Any, Protocol
 
+from src.budget import BudgetGuard
 from src.llm.base import LLMProvider, LLMResponse
 from src.state import WritingState
 from src.tools.base import Tool
@@ -53,11 +54,14 @@ class BaseAgent(ABC):
         llm: LLMProvider,
         system_prompt: str,
         tools: list[Tool] | None = None,
+        budget: BudgetGuard | None = None,
     ):
         self.name = name
         self.llm = llm
         self.system_prompt = system_prompt
         self.logger = logging.getLogger(f"src.agents.{name}")
+        # 同一 run 的全部 Agent 共享同一个 BudgetGuard 实例（由编排器注入）
+        self.budget = budget
 
         # 以 LLM 侧的函数名为键建立分发表。schema 在建表时深拷贝快照，
         # 使「向模型宣告的工具」与「能调度的实现」不会因事后修改而分裂。
@@ -142,13 +146,19 @@ class BaseAgent(ABC):
         """单次 LLM 调用，并统一累计 Token 消耗。
 
         所有 Agent 的 LLM 交互都应经过此处，否则 state.token_usage 会漏统计。
+        预算熔断也挂在此处：调用前预检、成功后按真实 usage 结算——
+        BudgetExceededError 向上传播，由作业层把 run 落位 PARTIAL。
         """
+        if self.budget:
+            self.budget.check_before_call()
         resp = await self.llm.chat(
             messages=messages,
             tools=tools,
             temperature=temperature,
         )
         if resp.usage:
+            if self.budget:
+                self.budget.settle(resp.usage)
             for k, v in resp.usage.items():
                 state.token_usage[k] = state.token_usage.get(k, 0) + v
         return resp

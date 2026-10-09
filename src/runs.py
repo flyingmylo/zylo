@@ -55,7 +55,8 @@ _ALLOWED_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
             RunStatus.COMPLETED,
             RunStatus.FAILED,
             RunStatus.CANCELLED,
-            # 仅服务恢复逻辑使用：进程重启后把遗留的 RUNNING 落位为 PARTIAL
+            # 两个合法来源：进程重启后服务恢复逻辑的落位，
+            # 以及运行期预算耗尽的熔断（调大预算后可 resume 续跑）
             RunStatus.PARTIAL,
         }
     ),

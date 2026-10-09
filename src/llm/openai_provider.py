@@ -16,10 +16,19 @@ class OpenAICompatibleProvider(LLMProvider):
         api_key: str,
         model: str,
         base_url: str | None = None,
+        timeout: float = 60.0,
+        max_retries: int = 3,
     ):
         if not model:
             raise ValueError("必须显式指定模型名称，本项目不提供默认模型。")
-        self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        # SDK 内建重试已覆盖 429/5xx/连接超时：指数退避并尊重 Retry-After
+        # 头；这里只做显式配置化，不自研重试轮子
+        self.client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
+            max_retries=max_retries,
+        )
         self.model = model
 
     async def chat(

@@ -1,3 +1,4 @@
+from src.budget import BudgetGuard
 from src.llm.base import LLMProvider
 from src.prompts import REVIEWER_SYSTEM_PROMPT
 from src.state import GLOBAL_SCOPE, Stage, WritingState
@@ -13,8 +14,10 @@ class ReviewerAgent(BaseAgent):
     3. 输出结构化评审报告（得分、通过判定、针对性修改清单）
     """
 
-    def __init__(self, llm: LLMProvider):
-        super().__init__(name="Reviewer", llm=llm, system_prompt=REVIEWER_SYSTEM_PROMPT)
+    def __init__(self, llm: LLMProvider, budget: BudgetGuard | None = None):
+        super().__init__(
+            name="Reviewer", llm=llm, system_prompt=REVIEWER_SYSTEM_PROMPT, budget=budget
+        )
 
     async def run(self, state: WritingState) -> WritingState:
         state.current_stage = Stage.REVIEWING
