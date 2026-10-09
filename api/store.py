@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from src.events import RunEvent
-from src.runs import Run, RunStatus
+from src.runs import ReviewAction, ReviewDecision, Run, RunStatus
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -55,6 +55,20 @@ CREATE TABLE IF NOT EXISTS state_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_state_snapshots_run
     ON state_snapshots(run_id, id);
+
+CREATE TABLE IF NOT EXISTS review_decisions (
+    run_id        TEXT NOT NULL REFERENCES runs(id),
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    revision      INTEGER NOT NULL,
+    critique_id   TEXT NOT NULL,
+    action        TEXT NOT NULL,
+    edited_advice TEXT,
+    reason        TEXT,
+    decided_at    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_decisions_run
+    ON review_decisions(run_id, revision);
 """
 
 
@@ -216,6 +230,51 @@ class RunStore:
         if row is None:
             return None
         return json.loads(row["state_json"])
+
+    # ---- review_decisions ----
+
+    def save_review_decisions(self, decisions: list[ReviewDecision]) -> None:
+        """批量落盘一轮人工决策（M3-3）；只增不改，作为后续评估数据。"""
+        rows = [
+            (
+                d.run_id,
+                d.revision,
+                d.critique_id,
+                d.action.value,
+                d.edited_advice,
+                d.reason,
+                d.decided_at.isoformat(),
+            )
+            for d in decisions
+        ]
+        self._conn.executemany(
+            """
+            INSERT INTO review_decisions
+                (run_id, revision, critique_id, action, edited_advice, reason, decided_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        self._conn.commit()
+
+    def list_review_decisions(self, run_id: str) -> list[ReviewDecision]:
+        """该 run 的全部人工决策，按落库顺序返回。"""
+        rows = self._conn.execute(
+            "SELECT * FROM review_decisions WHERE run_id = ? ORDER BY id ASC",
+            (run_id,),
+        ).fetchall()
+        return [
+            ReviewDecision(
+                run_id=row["run_id"],
+                revision=row["revision"],
+                critique_id=row["critique_id"],
+                action=ReviewAction(row["action"]),
+                edited_advice=row["edited_advice"],
+                reason=row["reason"],
+                decided_at=datetime.fromisoformat(row["decided_at"]),
+            )
+            for row in rows
+        ]
 
     # ---- 生命周期 ----
 

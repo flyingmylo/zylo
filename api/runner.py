@@ -13,14 +13,23 @@ from api.bus import TraceBus
 from api.store import RunStore
 from src.budget import BudgetExceededError
 from src.events import EventStatus, RunEvent, SpanKind
-from src.runs import Run, RunStatus
-from src.state import WritingState, serialize_state
+from src.orchestrator import HumanReviewRequired
+from src.runs import ReviewAction, ReviewDecision, Run, RunStatus
+from src.state import WritingState, deserialize_state, serialize_state
 
 logger = logging.getLogger("src.api.runner")
 
 
 class RunNotFoundError(KeyError):
     """查询的 run_id 不存在。"""
+
+
+class ReviewNotPendingError(ValueError):
+    """决策到达时 run 并不处于等待人审状态。"""
+
+
+class ReviewDecisionMismatchError(ValueError):
+    """决策集与当前轮审稿意见不吻合（未全覆盖 / 含未知或重复 ID / 轮次不符）。"""
 
 
 class RunExecutor(Protocol):
@@ -50,6 +59,8 @@ class JobRunner:
         self._runs: dict[str, Run] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._results: dict[str, WritingState] = {}
+        # 人审停点时的 state 内存引用（快照已先行落盘，此为免反序列化加速层）
+        self._pending_reviews: dict[str, WritingState] = {}
 
     # ---- 注册与查询 ----
 
@@ -58,11 +69,17 @@ class JobRunner:
         topic: str,
         sources: list[str] | None = None,
         instructions: str = "",
+        human_review: bool = False,
     ) -> Run:
         """登记一个 queued 状态的新运行（尚未启动）。"""
         run = Run(
             topic=topic,
-            config={"sources": sources or [], "instructions": instructions},
+            config={
+                "sources": sources or [],
+                "instructions": instructions,
+                # executor_factory 据此为该 run 构造开启人审停点的编排器
+                "human_review": human_review,
+            },
         )
         self._runs[run.id] = run
         self._persist(run)
@@ -99,17 +116,31 @@ class JobRunner:
     # ---- 执行 ----
 
     def launch(
-        self, run_id: str, executor: RunExecutor, output_dir: str = "output"
+        self,
+        run_id: str,
+        executor: RunExecutor,
+        output_dir: str = "output",
+        resume_state: WritingState | None = None,
     ) -> None:
-        """把 queued 运行派发给后台任务；同一 run 重复 launch 视为编程错误。"""
+        """把 queued 运行派发给后台任务；同一 run 重复 launch 视为编程错误。
+
+        resume_state：人审决策注入后的 state（M3-3）——执行器据此跳过
+        已完成阶段，直接消费决策结果续跑。
+        """
         run = self.get(run_id)
         if run.id in self._tasks:
             raise ValueError(f"run {run_id} 已在执行中")
         self._tasks[run.id] = asyncio.create_task(
-            self._execute(run, executor, output_dir)
+            self._execute(run, executor, output_dir, resume_state)
         )
 
-    async def _execute(self, run: Run, executor: RunExecutor, output_dir: str) -> None:
+    async def _execute(
+        self,
+        run: Run,
+        executor: RunExecutor,
+        output_dir: str,
+        resume_state: WritingState | None = None,
+    ) -> None:
         def on_checkpoint(state: WritingState) -> None:
             """阶段边界落快照：崩溃后 resume 从此续跑，已付的 LLM 费用不打水漂。"""
             if self.store:
@@ -126,6 +157,7 @@ class JobRunner:
                 local_files=run.config.get("sources"),
                 extra_instructions=str(run.config.get("instructions", "")),
                 output_dir=output_dir,
+                resume_state=resume_state,
                 on_checkpoint=on_checkpoint,
             )
             self._results[run.id] = state
@@ -137,6 +169,21 @@ class JobRunner:
                 payload={
                     "review_score": state.review_score,
                     "total_tokens": state.token_usage.get("total_tokens", 0),
+                },
+            )
+        except HumanReviewRequired as exc:
+            # 人审停点（M3-3）：不是失败，state 已随 checkpoint 落快照。
+            # 流不终结——订阅者保持挂起，决策恢复后的新事件继续原流推送
+            run.transition(RunStatus.WAITING_FOR_HUMAN_REVIEW)
+            self._persist(run)
+            self._pending_reviews[run.id] = exc.state
+            self._emit(
+                run,
+                EventStatus.WAITING,
+                payload={
+                    "revision": exc.state.revision_count,
+                    "score": exc.state.review_score,
+                    "critiques": len(exc.state.actionable_revisions),
                 },
             )
         except asyncio.CancelledError:
@@ -168,8 +215,12 @@ class JobRunner:
                 payload={"error": f"{type(exc).__name__}: {exc}"},
             )
         finally:
-            # 无论成败都终结订阅流，SSE 客户端据此收尾
-            self.bus.close(run.id)
+            # 任务结束即从调度表摘除：人审决策恢复要对同一 run 重新 launch
+            self._tasks.pop(run.id, None)
+            # 等待人审不是流终结（run 仍活着，决策后原订阅继续收新事件）；
+            # 其余终态才 close，SSE 客户端据此收尾
+            if run.status is not RunStatus.WAITING_FOR_HUMAN_REVIEW:
+                self.bus.close(run.id)
 
     def _emit(
         self, run: Run, status: EventStatus, payload: dict[str, Any] | None = None
@@ -190,6 +241,81 @@ class JobRunner:
         task = self._tasks.get(run_id)
         if task is not None:
             await asyncio.wait_for(task, timeout=300)
+
+    # ---- 人工审稿决策（M3-3） ----
+
+    def pending_review(self, run_id: str) -> WritingState | None:
+        """等待人审的 run 的停点 state：内存优先，miss 回落最新快照。"""
+        state = self._pending_reviews.get(run_id)
+        if state is not None:
+            return state
+        if self.store:
+            payload = self.store.latest_state_snapshot(run_id)
+            if payload is not None:
+                return deserialize_state(payload)
+        return None
+
+    def apply_review_decisions(
+        self,
+        run_id: str,
+        decisions: list[ReviewDecision],
+        executor_factory: Callable[[Run], RunExecutor],
+        output_dir: str = "output",
+    ) -> Run:
+        """校验并注入人工决策，随后恢复执行（POST /review-decisions 的核心）。
+
+        决策必须恰好覆盖当前轮全部意见（防止漏决策静默通过）；
+        注入规则：ACCEPT 保留、EDIT 换写建议、REJECT 移除、
+        APPROVE_FINAL 或全拒 → 视为拍板定稿（review_passed=True）。
+        """
+        run = self.get(run_id)
+        if run.status is not RunStatus.WAITING_FOR_HUMAN_REVIEW:
+            raise ReviewNotPendingError(f"运行不在等待人审状态（当前 {run.status.value}）")
+
+        state = self.pending_review(run_id)
+        if state is None:
+            raise ReviewNotPendingError("找不到停点状态（快照缺失）")
+
+        current_ids = [rev["critique_id"] for rev in state.actionable_revisions]
+        decision_ids = [d.critique_id for d in decisions]
+        if (
+            sorted(decision_ids) != sorted(current_ids)
+            or len(set(decision_ids)) != len(decision_ids)
+            or any(d.revision != state.revision_count for d in decisions)
+        ):
+            raise ReviewDecisionMismatchError(
+                f"决策须恰好覆盖第 {state.revision_count} 轮的 "
+                f"{len(current_ids)} 条意见（收到 {len(decisions)} 条，"
+                "每条意见一个决策，不允许遗漏或重复）"
+            )
+
+        by_id = {d.critique_id: d for d in decisions}
+        if any(d.action is ReviewAction.APPROVE_FINAL for d in decisions):
+            state.review_passed = True
+        else:
+            kept: list[dict[str, str]] = []
+            for rev in state.actionable_revisions:
+                decision = by_id[rev["critique_id"]]
+                if decision.action is ReviewAction.ACCEPT:
+                    kept.append(rev)
+                elif decision.action is ReviewAction.EDIT:
+                    kept.append({**rev, "advice": decision.edited_advice or rev["advice"]})
+                # REJECT：丢弃该意见（理由已随决策落库）
+            state.actionable_revisions = kept
+            # 全部拒绝 = 人认可当前稿，等价拍板定稿
+            state.review_passed = not kept
+
+        if self.store:
+            self.store.save_review_decisions(decisions)
+
+        self._pending_reviews.pop(run_id, None)
+        # WAITING→REVISING→(launch 后)RUNNING：轨迹贴合 PLAN 状态图
+        run.transition(RunStatus.REVISING)
+        self._persist(run)
+        self.launch(
+            run_id, executor_factory(run), output_dir=output_dir, resume_state=state
+        )
+        return run
 
 
 def recover_stale_runs(store: RunStore) -> list[Run]:

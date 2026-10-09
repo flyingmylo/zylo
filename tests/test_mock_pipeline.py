@@ -7,7 +7,7 @@ from src.events import EventStatus, RunEvent
 from src.llm.base import LLMProvider, LLMResponse
 from src.llm.mock import MOCK_USAGE, MockLLMProvider
 from src.orchestrator import WritingOrchestrator
-from src.runs import RunStatus
+from src.runs import Run, RunStatus
 from src.state import deserialize_state, serialize_state
 
 
@@ -257,3 +257,205 @@ async def test_resume_skips_completed_stages(tmp_path):
     assert resumed_state.outline_title == first_state.outline_title
     assert resumed_state.revision_count == 1
     assert resumed_state.review_score == 92.0
+
+
+# --------------------------------------------------------------------------
+# M3-3：人在回路——审稿停点与决策重入
+# --------------------------------------------------------------------------
+
+
+async def test_human_review_pauses_then_completes(tmp_path):
+    """human_review 开启：首轮审稿后停 WAITING；决策注入后恢复，终稿零浪费。
+
+    恢复沿用同一个 Mock 实例（审稿轮次延续），第二轮通过后再次停点，
+    空决策集（无意见可决策）等价拍板定稿。停点/恢复不额外多花 LLM 调用。
+    """
+    from src.runs import ReviewAction, ReviewDecision
+
+    bus = TraceBus()
+    runner = JobRunner(bus)
+    mock_llm = MockLLMProvider()
+
+    def make_executor(run) -> WritingOrchestrator:
+        return WritingOrchestrator(
+            llm=mock_llm,
+            embedding_provider=DummyEmbeddingProvider(),
+            human_review=bool(run.config.get("human_review")),
+        )
+
+    run = runner.create("人审演示", human_review=True)
+    runner.launch(run.id, make_executor(run), output_dir=str(tmp_path))
+    await runner.wait(run.id)
+
+    # 首轮审稿完成即停：等待人审而非自动修订
+    assert run.status is RunStatus.WAITING_FOR_HUMAN_REVIEW
+    pending = runner.pending_review(run.id)
+    assert pending is not None
+    assert pending.awaiting_human is True
+    assert pending.revision_count == 0
+    ids = [rev["critique_id"] for rev in pending.actionable_revisions]
+    assert len(ids) == 1  # Mock 首轮审稿恰好一条全局意见
+
+    # 采纳该意见 → 恢复执行：Writer 修订 → 第二轮审稿通过 → 再次停点
+    decisions = [
+        ReviewDecision(
+            run_id=run.id, revision=0, critique_id=ids[0], action=ReviewAction.ACCEPT
+        )
+    ]
+    runner.apply_review_decisions(
+        run.id, decisions, make_executor, output_dir=str(tmp_path)
+    )
+    await runner.wait(run.id)
+    assert run.status is RunStatus.WAITING_FOR_HUMAN_REVIEW
+    pending2 = runner.pending_review(run.id)
+    assert pending2 is not None
+    assert pending2.revision_count == 1
+    assert pending2.review_passed is True
+    assert pending2.actionable_revisions == []
+
+    # 无意见 → 空决策集即拍板：恢复后直接导出定稿
+    runner.apply_review_decisions(run.id, [], make_executor, output_dir=str(tmp_path))
+    await runner.wait(run.id)
+
+    assert run.status is RunStatus.COMPLETED
+    state = runner.result(run.id)
+    assert state is not None
+    assert state.revision_count == 1
+    assert state.review_score == 92.0
+    assert state.awaiting_human is False
+    # 与自动路径完全相同的 10 次调用：停点与决策重入零额外 LLM 成本
+    assert state.token_usage["total_tokens"] == MOCK_USAGE["total_tokens"] * 10
+
+
+async def test_waiting_stream_stays_open_for_reconnect():
+    """WAITING 期间 SSE 订阅流不终结：决策后的新事件继续原流推送。"""
+    import asyncio
+
+    import pytest
+
+    bus = TraceBus()
+    runner = JobRunner(bus)
+    mock_llm = MockLLMProvider()
+
+    def make_executor(run) -> WritingOrchestrator:
+        return WritingOrchestrator(
+            llm=mock_llm,
+            embedding_provider=DummyEmbeddingProvider(),
+            human_review=True,
+        )
+
+    run = runner.create("流保持")
+    runner.launch(run.id, make_executor(run), output_dir="/tmp/zylo-waiting-test")
+    await runner.wait(run.id)
+    assert run.status is RunStatus.WAITING_FOR_HUMAN_REVIEW
+
+    sub = bus.subscribe(run.id)
+    try:
+        # 流必须保持挂起（不终结）；能立即 drain 完说明被误关了
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(_drain_mock(sub), timeout=0.2)
+    finally:
+        bus.unsubscribe(run.id, sub)
+        bus.close(run.id)
+
+
+async def _drain_mock(sub):
+    async for _ in sub:
+        pass
+
+
+async def test_decision_semantics_edit_reject_and_validation():
+    """决策注入语义（单元级）：EDIT 替换建议、REJECT 移除、全拒拍板；
+    未全覆盖 / 轮次错误 / 未知 ID 被拒绝。用记录型执行体隔离注入逻辑。"""
+    import pytest
+
+    from api.runner import ReviewDecisionMismatchError
+    from src.runs import ReviewAction, ReviewDecision
+    from src.state import WritingState
+
+    captured: dict[str, WritingState | None] = {}
+
+    class RecordingExecutor:
+        async def execute(
+            self,
+            topic,
+            local_files=None,
+            extra_instructions="",
+            output_dir="output",
+            resume_state=None,
+            on_checkpoint=None,
+        ):
+            captured["state"] = resume_state
+            return resume_state or WritingState(topic=topic)
+
+    def make_factory():
+        return lambda run: RecordingExecutor()
+
+    def _pending_runner(opinions: list[tuple[str, str]]) -> tuple[JobRunner, Run]:
+        """构造一个停在 WAITING、带指定意见集的 runner（不跑真实执行器）。"""
+        runner = JobRunner(TraceBus())
+        run = runner.create("决策语义", human_review=True)
+        run.transition(RunStatus.RUNNING)
+        state = WritingState(topic="t", revision_count=0)
+        state.actionable_revisions = [
+            {"critique_id": cid, "section": "全局", "advice": advice}
+            for cid, advice in opinions
+        ]
+        runner._pending_reviews[run.id] = state
+        run.transition(RunStatus.WAITING_FOR_HUMAN_REVIEW)
+        return runner, run
+
+    # ---- 校验路径 ----
+    runner, run = _pending_runner([("aaa", "意见A")])
+    with pytest.raises(ReviewDecisionMismatchError):  # 空决策 vs 1 条意见
+        runner.apply_review_decisions(run.id, [], make_factory())
+    with pytest.raises(ReviewDecisionMismatchError):  # 轮次错误
+        runner.apply_review_decisions(
+            run.id,
+            [ReviewDecision(run_id=run.id, revision=5, critique_id="aaa", action=ReviewAction.REJECT)],
+            make_factory(),
+        )
+    with pytest.raises(ReviewDecisionMismatchError):  # 未知 ID
+        runner.apply_review_decisions(
+            run.id,
+            [ReviewDecision(run_id=run.id, revision=0, critique_id="zzz", action=ReviewAction.ACCEPT)],
+            make_factory(),
+        )
+
+    # ---- EDIT + REJECT 混合：EDIT 替换建议文本，REJECT 被移除 ----
+    runner, run = _pending_runner([("aaa", "原意见A"), ("bbb", "原意见B"), ("ccc", "原意见C")])
+    runner.apply_review_decisions(
+        run.id,
+        [
+            ReviewDecision(run_id=run.id, revision=0, critique_id="aaa", action=ReviewAction.ACCEPT),
+            ReviewDecision(
+                run_id=run.id,
+                revision=0,
+                critique_id="bbb",
+                action=ReviewAction.EDIT,
+                edited_advice="（人工改写）意见B",
+            ),
+            ReviewDecision(run_id=run.id, revision=0, critique_id="ccc", action=ReviewAction.REJECT, reason="不必改"),
+        ],
+        make_factory(),
+    )
+    await runner.wait(run.id)
+    injected = captured["state"]
+    assert injected is not None
+    assert [
+        (rev["critique_id"], rev["advice"]) for rev in injected.actionable_revisions
+    ] == [("aaa", "原意见A"), ("bbb", "（人工改写）意见B")]  # ccc 已移除
+    assert injected.review_passed is False  # 仍有意见 → 进入修订轮
+
+    # ---- 全部拒绝 = 认可当前稿，等价拍板 ----
+    runner, run = _pending_runner([("aaa", "意见A")])
+    runner.apply_review_decisions(
+        run.id,
+        [ReviewDecision(run_id=run.id, revision=0, critique_id="aaa", action=ReviewAction.REJECT)],
+        make_factory(),
+    )
+    await runner.wait(run.id)
+    injected2 = captured["state"]
+    assert injected2 is not None
+    assert injected2.actionable_revisions == []
+    assert injected2.review_passed is True

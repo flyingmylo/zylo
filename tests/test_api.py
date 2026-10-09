@@ -256,3 +256,96 @@ async def test_sse_malformed_last_event_id_falls_back_to_full_replay():
 
     assert resp.status_code == 200
     assert _sse_ids(resp.text)[0] == 1
+
+
+# --------------------------------------------------------------------------
+# M3-3：人在回路——审稿停点与决策端点
+# --------------------------------------------------------------------------
+
+
+async def test_human_review_flow_over_http(tmp_path):
+    """HTTP 全流程：创建（human_review）→ 停 WAITING → 查意见 → 决策 → 完成。"""
+    from src.embeddings.dummy import DummyEmbeddingProvider
+    from src.llm.mock import MockLLMProvider
+    from src.orchestrator import WritingOrchestrator
+
+    store = RunStore(tmp_path / "zylo.db")
+    bus = TraceBus(store=store)
+    runner = JobRunner(bus, store=store)
+    mock_llm = MockLLMProvider()
+
+    def make_executor(run):
+        return WritingOrchestrator(
+            llm=mock_llm,
+            embedding_provider=DummyEmbeddingProvider(),
+            human_review=bool(run.config.get("human_review")),
+        )
+
+    app = create_app(bus=bus, runner=runner, executor_factory=make_executor)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+        created = (
+            await client.post("/api/runs", json={"topic": "人审演示", "human_review": True})
+        ).json()
+        run_id = created["id"]
+        await runner.wait(run_id)
+
+        # 停在等待人审
+        detail = (await client.get(f"/api/runs/{run_id}")).json()
+        assert detail["status"] == "waiting_for_human_review"
+
+        # 待决策意见可见：稳定 ID + 作用域 + 建议
+        review = (await client.get(f"/api/runs/{run_id}/review")).json()
+        assert review["revision"] == 0
+        assert review["passed"] is False
+        assert len(review["opinions"]) == 1
+        opinion = review["opinions"][0]
+        assert opinion["critique_id"] and opinion["scope"] and opinion["advice"]
+
+        # 非等待状态查意见 → 409（用另一个已完成的 run 验证）
+        other = (await client.post("/api/runs", json={"topic": "全自动"})).json()
+        await runner.wait(other["id"])
+        resp409 = await client.get(f"/api/runs/{other['id']}/review")
+        assert resp409.status_code == 409
+
+        # 部分决策（漏掉意见）→ 422，run 仍 WAITING
+        partial = await client.post(
+            f"/api/runs/{run_id}/review-decisions", json={"items": []}
+        )
+        assert partial.status_code == 422
+        assert partial.json()["error"]["code"] == "decision_mismatch"
+
+        # 采纳全部意见 → 202，恢复执行到第二轮审稿（通过）后再次停点
+        accepted = await client.post(
+            f"/api/runs/{run_id}/review-decisions",
+            json={
+                "items": [
+                    {
+                        "critique_id": opinion["critique_id"],
+                        "action": "accept",
+                    }
+                ]
+            },
+        )
+        assert accepted.status_code == 202
+        await runner.wait(run_id)
+        review2 = (await client.get(f"/api/runs/{run_id}/review")).json()
+        assert review2["revision"] == 1
+        assert review2["passed"] is True
+        assert review2["opinions"] == []
+
+        # 无意见 → 空决策集拍板 → 完成导出
+        final = await client.post(
+            f"/api/runs/{run_id}/review-decisions", json={"items": []}
+        )
+        assert final.status_code == 202
+        await runner.wait(run_id)
+
+        assert (await client.get(f"/api/runs/{run_id}")).json()["status"] == "completed"
+        article = (await client.get(f"/api/runs/{run_id}/article")).json()
+        assert article["review_score"] == 92.0
+
+        # 人工决策已落库（评估数据）：一条 accept，revision 0
+        decisions = store.list_review_decisions(run_id)
+        assert len(decisions) == 1
+        assert decisions[0].action.value == "accept"
+        assert decisions[0].revision == 0

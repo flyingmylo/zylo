@@ -10,9 +10,21 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from api.bus import TraceBus
-from api.runner import JobRunner, RunExecutor, RunNotFoundError
-from api.schema import ArticleResponse, RunCreateRequest
-from src.runs import Run, RunStatus
+from api.runner import (
+    JobRunner,
+    ReviewDecisionMismatchError,
+    ReviewNotPendingError,
+    RunExecutor,
+    RunNotFoundError,
+)
+from api.schema import (
+    ArticleResponse,
+    ReviewDecisionsRequest,
+    ReviewOpinion,
+    ReviewResponse,
+    RunCreateRequest,
+)
+from src.runs import ReviewDecision, Run, RunStatus
 
 API_PREFIX = "/api"
 
@@ -39,11 +51,28 @@ def create_app(
             content={"error": {"code": "run_not_found", "message": f"运行 {exc.args[0]} 不存在"}},
         )
 
+    @app.exception_handler(ReviewNotPendingError)
+    async def _review_not_pending(_: Request, exc: ReviewNotPendingError) -> JSONResponse:
+        return JSONResponse(
+            status_code=409,
+            content={"error": {"code": "review_not_pending", "message": str(exc)}},
+        )
+
+    @app.exception_handler(ReviewDecisionMismatchError)
+    async def _decision_mismatch(_: Request, exc: ReviewDecisionMismatchError) -> JSONResponse:
+        return JSONResponse(
+            status_code=422,
+            content={"error": {"code": "decision_mismatch", "message": str(exc)}},
+        )
+
     @app.post(f"{API_PREFIX}/runs", status_code=201)
     async def create_run(body: RunCreateRequest, request: Request) -> dict:
         runner_: JobRunner = request.app.state.runner
         run = runner_.create(
-            topic=body.topic, sources=body.sources, instructions=body.instructions
+            topic=body.topic,
+            sources=body.sources,
+            instructions=body.instructions,
+            human_review=body.human_review,
         )
         runner_.launch(run.id, request.app.state.executor_factory(run))
         return run.model_dump(mode="json")
@@ -88,6 +117,61 @@ def create_app(
             review_score=state.review_score,
             revision_count=state.revision_count,
         )
+
+    @app.get(f"{API_PREFIX}/runs/{{run_id}}/review")
+    async def get_review(run_id: str, request: Request) -> ReviewResponse:
+        """当前轮审稿结果与待决策意见（仅 WAITING 状态可查）。"""
+        runner_: JobRunner = request.app.state.runner
+        run = runner_.get(run_id)  # 404 校验
+        if run.status is not RunStatus.WAITING_FOR_HUMAN_REVIEW:
+            return JSONResponse(  # pyright: ignore[reportReturnType]
+                status_code=409,
+                content={
+                    "error": {
+                        "code": "review_not_pending",
+                        "message": f"运行不在等待人审状态（当前 {run.status.value}）",
+                    }
+                },
+            )
+        state = runner_.pending_review(run_id)
+        assert state is not None, "WAITING 状态必有停点 state（内存或快照）"
+        return ReviewResponse(
+            revision=state.revision_count,
+            score=state.review_score,
+            passed=state.review_passed,
+            opinions=[
+                ReviewOpinion(
+                    critique_id=rev["critique_id"],
+                    scope=rev["section"],
+                    advice=rev["advice"],
+                )
+                for rev in state.actionable_revisions
+            ],
+        )
+
+    @app.post(f"{API_PREFIX}/runs/{{run_id}}/review-decisions", status_code=202)
+    async def submit_review_decisions(
+        run_id: str, body: ReviewDecisionsRequest, request: Request
+    ) -> dict:
+        """注入人工决策并恢复执行；决策须恰好覆盖当前轮全部意见。"""
+        runner_: JobRunner = request.app.state.runner
+        pending = runner_.pending_review(run_id)
+        revision = pending.revision_count if pending else 0
+        decisions = [
+            ReviewDecision(
+                run_id=run_id,
+                revision=revision,
+                critique_id=item.critique_id,
+                action=item.action,
+                edited_advice=item.edited_advice,
+                reason=item.reason,
+            )
+            for item in body.items
+        ]
+        run = runner_.apply_review_decisions(
+            run_id, decisions, request.app.state.executor_factory
+        )
+        return {"run_id": run.id, "status": run.status.value}
 
     @app.get(f"{API_PREFIX}/runs/{{run_id}}/events")
     async def stream_events(run_id: str, request: Request, after: int = 0) -> StreamingResponse:
