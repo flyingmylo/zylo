@@ -108,44 +108,80 @@ def test_parse_llm_json_never_raises_on_garbage():
 
 
 @pytest.mark.asyncio
-async def test_planner_unparseable_json_falls_back_to_default_outline():
-    """大纲 JSON 彻底无法解析时必须落模板大纲，而不是抛异常。"""
-    llm = ScriptedLLM([LLMResponse(content='好的，大纲如下 {"sections": [坏}, 请过目')])
+async def test_planner_unparseable_json_degrades_after_retry():
+    """大纲 JSON 彻底无法解析：重试一次后仍坏 → 模板大纲 + planning_degraded 留痕。"""
+    llm = ScriptedLLM(
+        [
+            LLMResponse(content='好的，大纲如下 {"sections": [坏}, 请过目'),
+            LLMResponse(content='还是很坏 {"sections": [又坏}'),
+        ]
+    )
     state = await PlannerAgent(llm).run(WritingState(topic="KV-Cache"))
 
-    assert len(state.sections) == 4
-    assert state.outline_title
-    assert all(s.retrieval_query_zh for s in state.sections)
+    assert len(state.sections) == 4  # 模板大纲
+    assert any("planning_degraded" in e for e in state.errors)
+    assert len(llm.calls) == 2  # 失败重试恰好一次
 
 
 @pytest.mark.asyncio
-async def test_planner_valid_json_with_unusable_sections_falls_back():
-    """输出是合法 JSON 对象但 sections 缺失/非列表/为空时同样落模板大纲。
+async def test_planner_recovers_on_retry_after_bad_output():
+    """首次输出不合规、重试合规：采用重试结果，不降级。"""
+    bad = '{"outline_title": "", "sections": []}'  # 标题空 + 无小节：schema 拒绝
+    good = json.dumps(
+        {
+            "outline_title": "KV-Cache 深度解析",
+            "sections": [
+                {
+                    "title": "一、原理",
+                    "target_words": 500,
+                    "retrieval_query_zh": "原理",
+                }
+            ],
+        }
+    )
+    llm = ScriptedLLM([LLMResponse(content=bad), LLMResponse(content=good)])
 
-    否则 0 节空大纲会一路走到导出，产出空文章。
-    """
-    for content in (
-        '{"queries": ["无关字段"]}',  # 合法对象但没有 sections
-        '{"sections": "一、串"},',  # sections 非列表
-        '{"sections": []}',  # 显式空大纲
+    state = await PlannerAgent(llm).run(WritingState(topic="KV-Cache"))
+
+    assert state.outline_title == "KV-Cache 深度解析"
+    assert state.sections[0].title == "一、原理"
+    assert state.errors == []
+    # 重试消息必须携带具体错误，模型才有机会自我修正
+    retry_prompt = llm.calls[1]["messages"][-1]["content"]
+    assert "校验" in retry_prompt or "错误" in retry_prompt
+
+
+@pytest.mark.asyncio
+async def test_planner_valid_json_with_unusable_sections_degrades():
+    """输出是合法 JSON 对象但 sections 缺失/非列表/为空：重试后仍坏 → 降级。"""
+    for bad_content in (
+        '{"queries": ["无关字段"]}',
+        '{"sections": "一、串"}',
+        '{"sections": []}',
     ):
-        llm = ScriptedLLM([LLMResponse(content=content)])
+        llm = ScriptedLLM(
+            [LLMResponse(content=bad_content), LLMResponse(content=bad_content)]
+        )
         state = await PlannerAgent(llm).run(WritingState(topic="KV-Cache"))
-        assert len(state.sections) == 4, f"sections 不可用时必须兜底: {content}"
+        assert len(state.sections) == 4, f"sections 不可用必须降级: {bad_content}"
+        assert any("planning_degraded" in e for e in state.errors)
 
 
 @pytest.mark.asyncio
-async def test_reviewer_unparseable_json_falls_back_without_crashing():
-    """审稿 JSON 彻底无法解析时落默认通过，且不得抛异常。"""
-    llm = ScriptedLLM([LLMResponse(content='评审 {"passed": 坏} 完')])
+async def test_reviewer_unparseable_json_degrades_fail_closed():
+    """审稿 JSON 彻底无法解析：重试一次仍坏 → review_degraded，绝不默认通过。"""
+    llm = ScriptedLLM(
+        [LLMResponse(content='评审 {"passed": 坏} 完'), LLMResponse(content='还是 {"坏}')]
+    )
     state = WritingState(topic="t", outline_title="标题", full_draft="正文")
     state.sections = [SectionSpec(title="一、节", target_words=100)]
 
     state = await ReviewerAgent(llm).run(state)
 
-    assert state.review_passed is True
-    assert state.review_score == 85.0
-    assert "无法解析审稿人详细 JSON" in state.critiques[0]
+    assert state.review_passed is False  # fail-closed：降级不再放行
+    assert state.actionable_revisions == []
+    assert any("review_degraded" in e for e in state.errors)
+    assert len(llm.calls) == 2
 
 
 @pytest.mark.asyncio
@@ -175,45 +211,106 @@ async def test_reviewer_string_false_is_not_treated_as_passed():
 
 
 @pytest.mark.asyncio
-async def test_reviewer_coerces_common_truthy_string_variants():
-    """常见宽松布尔形态的规范化行为。"""
-    cases = [
-        (True, True),
-        ("true", True),
-        ("TRUE", True),
-        (1, True),
-        ("false", False),
-        ("0", False),
-        (0, False),
-        (None, True),  # 无法识别/缺失时回退 default
-    ]
-    for value, expected in cases:
-        assert ReviewerAgent._coerce_bool(value, default=True) is expected
-
-
-@pytest.mark.asyncio
-async def test_reviewer_malformed_score_falls_back_to_default():
-    """score 为非数值字符串时回退默认分，审稿流程不中断。"""
-    llm = ScriptedLLM(
-        [
-            LLMResponse(
-                content=json.dumps(
-                    {"passed": False, "score": "八十八", "critiques": [], "actionable_revisions": []}
-                )
-            )
-        ]
+async def test_reviewer_malformed_score_retries_then_degrades():
+    """score 为非数值字符串：schema 拒绝 → 重试；仍坏 → fail-closed 降级。"""
+    bad = json.dumps(
+        {"passed": False, "score": "八十八", "critiques": [], "actionable_revisions": []}
     )
+    llm = ScriptedLLM([LLMResponse(content=bad), LLMResponse(content=bad)])
+
     state = WritingState(topic="t", outline_title="标题", full_draft="正文")
     state.sections = [SectionSpec(title="一、节", target_words=100)]
 
     state = await ReviewerAgent(llm).run(state)
 
-    assert state.review_score == 85.0
-    assert state.review_passed is False  # passed 显式为 false，仅 score 回退默认值
+    assert state.review_passed is False
+    assert any("review_degraded" in e for e in state.errors)
 
 
 @pytest.mark.asyncio
-async def test_researcher_non_list_keywords_fall_back_to_topic(monkeypatch):
+async def test_reviewer_legacy_string_revisions_rejected_then_accepted_on_retry():
+    """旧字符串意见格式：schema 拒绝 → 重试输出结构化格式后被接受。"""
+    legacy = json.dumps(
+        {
+            "passed": False,
+            "score": 78.5,
+            "critiques": ["c"],
+            "actionable_revisions": ["一、核心原理：请增加双语对照。", "语言偏生硬。"],
+        }
+    )
+    corrected = json.dumps(
+        {
+            "passed": False,
+            "score": 78.5,
+            "critiques": ["c"],
+            "actionable_revisions": [
+                {"section": "一、核心原理", "advice": "请增加双语对照。"},
+                {"section": "全局", "advice": "语言整体更自然。"},
+            ],
+        }
+    )
+    llm = ScriptedLLM([LLMResponse(content=legacy), LLMResponse(content=corrected)])
+
+    state = WritingState(topic="t", outline_title="标题", full_draft="正文")
+    state.sections = [SectionSpec(title="一、核心原理", target_words=100)]
+
+    state = await ReviewerAgent(llm).run(state)
+
+    assert state.actionable_revisions == [
+        {"section": "一、核心原理", "advice": "请增加双语对照。"},
+        {"section": "全局", "advice": "语言整体更自然。"},
+    ]
+    assert state.errors == []
+
+
+@pytest.mark.asyncio
+async def test_reviewer_fuzzy_scope_normalized_and_unknown_retried():
+    """模糊 section 归一化为精确标题（保留容错）；完全定位不了的意见
+    触发重试修正，而非静默归入全局（基线 17/17 定位失败的根除验证）。"""
+    first = json.dumps(
+        {
+            "passed": False,
+            "score": 78.5,
+            "critiques": ["c"],
+            "actionable_revisions": [
+                {"section": "核心原理", "advice": "补充公式推导"},  # 模糊可归一
+                {"section": "第二节", "advice": "调整详略"},  # 完全无法定位
+            ],
+        }
+    )
+    corrected = json.dumps(
+        {
+            "passed": False,
+            "score": 78.5,
+            "critiques": ["c"],
+            "actionable_revisions": [
+                {"section": "核心原理", "advice": "补充公式推导"},
+                {"section": "二、实践", "advice": "调整详略"},
+            ],
+        }
+    )
+    llm = ScriptedLLM([LLMResponse(content=first), LLMResponse(content=corrected)])
+
+    state = WritingState(topic="t", outline_title="标题", full_draft="正文")
+    state.sections = [
+        SectionSpec(title="一、核心原理", target_words=100),
+        SectionSpec(title="二、实践", target_words=100),
+    ]
+
+    state = await ReviewerAgent(llm).run(state)
+
+    # 最终所有意见都精确落位，没有静默全局化
+    assert state.actionable_revisions == [
+        {"section": "一、核心原理", "advice": "补充公式推导"},
+        {"section": "二、实践", "advice": "调整详略"},
+    ]
+    # 重试的错误回灌里指明了非法取值与合法集合
+    retry_prompt = llm.calls[1]["messages"][-1]["content"]
+    assert "第二节" in retry_prompt
+
+
+@pytest.mark.asyncio
+async def test_reviewer_non_list_keywords_fall_back_to_topic(monkeypatch):
     """回归：检索词输出 {"queries": [...]} 之类对象时曾抛 KeyError。
 
     必须回退为原始主题继续调研，而不是打断整个阶段。
@@ -898,61 +995,6 @@ async def test_reviewer_preserves_explicit_global_scope_when_advice_names_sectio
             "advice": "统一一、原理与二、实践之间的术语表达",
         }
     ]
-
-
-@pytest.mark.asyncio
-async def test_reviewer_normalizes_legacy_string_revisions():
-    """模型偶发输出纯字符串旧格式：标题出现在文本里则归属该节，否则归全局。"""
-    llm = ScriptedLLM(
-        [
-            LLMResponse(
-                content=_review_json(
-                    [
-                        "一、核心原理：请务必增加键值缓存（KV-Cache）双语对照。",
-                        "语言整体偏生硬。",
-                    ]
-                )
-            )
-        ]
-    )
-    agent = ReviewerAgent(llm)
-    state = _review_state(["一、核心原理", "二、实践"])
-
-    state = await agent.run(state)
-
-    assert state.actionable_revisions == [
-        {
-            "section": "一、核心原理",
-            "advice": "一、核心原理：请务必增加键值缓存（KV-Cache）双语对照。",
-        },
-        {"section": "全局", "advice": "语言整体偏生硬。"},
-    ]
-
-
-@pytest.mark.asyncio
-async def test_reviewer_fuzzy_scope_match_and_global_fallback(caplog):
-    """section 与标题不完全一致时按包含关系匹配；完全匹配不上必须归全局并告警。"""
-    llm = ScriptedLLM(
-        [
-            LLMResponse(
-                content=_review_json(
-                    [
-                        {"section": "核心原理", "advice": "补充公式推导"},
-                        {"section": "第二节", "advice": "调整详略"},
-                    ]
-                )
-            )
-        ]
-    )
-    agent = ReviewerAgent(llm)
-    state = _review_state(["一、核心原理", "二、实践"])
-
-    with caplog.at_level(logging.WARNING):
-        state = await agent.run(state)
-
-    assert state.actionable_revisions[0]["section"] == "一、核心原理"
-    assert state.actionable_revisions[1]["section"] == "全局"
-    assert any("归入全局" in r.getMessage() for r in caplog.records)
 
 
 # --------------------------------------------------------------------------

@@ -153,7 +153,10 @@ class MultiRoundMockLLM(LLMProvider):
                             "score": 75.0,
                             "critiques": ["第一节缺少具体的术语英文对照。"],
                             "actionable_revisions": [
-                                "一、核心原理：请务必增加键值缓存（KV-Cache）双语对照。"
+                                {
+                                    "section": "一、核心原理",
+                                    "advice": "请务必增加键值缓存（KV-Cache）双语对照。",
+                                }
                             ],
                         }
                     )

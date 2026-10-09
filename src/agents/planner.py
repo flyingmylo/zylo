@@ -1,6 +1,7 @@
 from src.budget import BudgetGuard
 from src.llm.base import LLMProvider
 from src.prompts import PLANNER_SYSTEM_PROMPT
+from src.schemas import PlannerOutline, StructuredOutputError
 from src.state import SectionSpec, Stage, WritingState
 
 from .base import BaseAgent
@@ -33,66 +34,64 @@ class PlannerAgent(BaseAgent):
             {"role": "user", "content": user_content},
         ]
 
-        resp = await self._chat_with_tools(
-            messages=messages,
-            state=state,
-            temperature=0.4,
-        )
-
-        data = self._parse_llm_json(resp.content)
-        raw_sections = data.get("sections") if isinstance(data, dict) else None
-        if not isinstance(raw_sections, list) or not raw_sections:
-            # 解析失败、输出不是 JSON 对象、或 sections 缺失/非列表/为空，
-            # 都属于模型输出不可用：落模板大纲继续写作，
-            # 宁可用模板也不要 0 节空文章，更不能让流程在规划阶段崩溃
-            data = {
-                "outline_title": f"{state.topic} 深度技术解析与实践指南",
-                "target_total_words": 3000,
-                "sections": [
-                    {
-                        "title": "一、背景与核心痛点剖析",
-                        "target_words": 700,
-                        "focus_points": ["核心问题背景", "传统架构局限性"],
-                        "retrieval_query_zh": f"{state.topic} 痛点与背景",
-                        "retrieval_query_en": f"{state.topic} challenges and limitations",
-                    },
-                    {
-                        "title": "二、核心架构与技术原理",
-                        "target_words": 1200,
-                        "focus_points": ["核心设计机制", "关键算法与交互链路"],
-                        "retrieval_query_zh": f"{state.topic} 核心架构 原理",
-                        "retrieval_query_en": f"{state.topic} architecture and mechanisms",
-                    },
-                    {
-                        "title": "三、工程落地与最佳实践",
-                        "target_words": 800,
-                        "focus_points": ["典型生产环境配置", "性能优化与避坑指南"],
-                        "retrieval_query_zh": f"{state.topic} 实践 优化",
-                        "retrieval_query_en": f"{state.topic} best practices production deployment",
-                    },
-                    {
-                        "title": "四、总结与未来展望",
-                        "target_words": 300,
-                        "focus_points": ["技术趋势", "演进方向"],
-                        "retrieval_query_zh": f"{state.topic} 趋势",
-                        "retrieval_query_en": f"{state.topic} future trends",
-                    },
-                ],
-            }
-
-        state.outline_title = data.get("outline_title", f"{state.topic} 深度解析")
-        state.target_total_words = data.get("target_total_words", 3000)
-
-        sections = []
-        for s in data.get("sections", []):
-            sections.append(
-                SectionSpec(
-                    title=s.get("title", "未命名小节"),
-                    target_words=s.get("target_words", 600),
-                    focus_points=s.get("focus_points", []),
-                    retrieval_query_zh=s.get("retrieval_query_zh", state.topic),
-                    retrieval_query_en=s.get("retrieval_query_en", ""),
-                )
+        try:
+            outline = await self._chat_structured(
+                messages, PlannerOutline, state, temperature=0.4
             )
-        state.sections = sections
+        except StructuredOutputError as exc:
+            # planning_degraded：重试后仍不合规。落模板大纲继续写作并显式留痕，
+            # 绝不静默（修订回路与终稿溯源都需要知道大纲不是模型产出）
+            self.logger.warning("大纲输出降级：%s", exc)
+            state.errors.append(f"planning_degraded: {exc}")
+            state.sections = _fallback_sections(state.topic)
+            state.outline_title = f"{state.topic} 深度技术解析与实践指南"
+            state.target_total_words = 3000
+            return state
+
+        state.outline_title = outline.outline_title
+        state.target_total_words = outline.target_total_words
+        state.sections = [
+            SectionSpec(
+                title=s.title,
+                target_words=s.target_words,
+                focus_points=s.focus_points,
+                retrieval_query_zh=s.retrieval_query_zh or state.topic,
+                retrieval_query_en=s.retrieval_query_en,
+            )
+            for s in outline.sections
+        ]
         return state
+
+
+def _fallback_sections(topic: str) -> list[SectionSpec]:
+    """planning_degraded 时的模板大纲：保证修订回路有可定位的标题可用。"""
+    return [
+        SectionSpec(
+            title="一、背景与核心痛点剖析",
+            target_words=700,
+            focus_points=["核心问题背景", "传统架构局限性"],
+            retrieval_query_zh=f"{topic} 痛点与背景",
+            retrieval_query_en=f"{topic} challenges and limitations",
+        ),
+        SectionSpec(
+            title="二、核心架构与技术原理",
+            target_words=1200,
+            focus_points=["核心设计机制", "关键算法与交互链路"],
+            retrieval_query_zh=f"{topic} 核心架构 原理",
+            retrieval_query_en=f"{topic} architecture and mechanisms",
+        ),
+        SectionSpec(
+            title="三、工程落地与最佳实践",
+            target_words=800,
+            focus_points=["典型生产环境配置", "性能优化与避坑指南"],
+            retrieval_query_zh=f"{topic} 实践 优化",
+            retrieval_query_en=f"{topic} best practices production deployment",
+        ),
+        SectionSpec(
+            title="四、总结与未来展望",
+            target_words=300,
+            focus_points=["技术趋势", "演进方向"],
+            retrieval_query_zh=f"{topic} 趋势",
+            retrieval_query_en=f"{topic} future trends",
+        ),
+    ]

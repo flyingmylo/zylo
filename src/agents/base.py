@@ -3,12 +3,29 @@ import json
 import logging
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Protocol
+from collections.abc import Callable
+from typing import Any, Protocol, TypeVar
+
+from pydantic import BaseModel, ValidationError
 
 from src.budget import BudgetGuard
 from src.llm.base import LLMProvider, LLMResponse
+from src.schemas import StructuredOutputError
 from src.state import WritingState
 from src.tools.base import Tool
+
+# 结构化输出的目标模型类型（PlannerOutline / ReviewReport 等）；
+# 绑定 BaseModel 上界才能在校验处访问 model_validate
+SchemaT = TypeVar("SchemaT", bound=BaseModel)
+
+
+def _summarize_validation_error(exc: ValidationError) -> str:
+    """把 Pydantic 校验错误压成单行摘要，便于回灌给模型自我修正。"""
+    parts = []
+    for err in exc.errors()[:5]:
+        loc = ".".join(str(x) for x in err["loc"]) or "(root)"
+        parts.append(f"{loc}: {err['msg']}")
+    return "；".join(parts)
 
 
 class AgentKnowledgeBase(Protocol):
@@ -129,6 +146,58 @@ class BaseAgent(ABC):
                 except json.JSONDecodeError:
                     continue
         return None
+
+    async def _chat_structured(
+        self,
+        messages: list[dict[str, Any]],
+        schema: type[SchemaT],
+        state: WritingState,
+        temperature: float = 0.4,
+        validator: Callable[[SchemaT], str | None] | None = None,
+    ) -> SchemaT:
+        """请求结构化输出并做两级校验：schema 校验 + 业务取值域校验。
+
+        任一层失败都会把具体错误回灌给模型重试一次（模型多数时候能据此
+        自我修正——比静默兜底多救回一轮）；重试仍失败抛 StructuredOutputError，
+        由调用方决定降级语义（degraded 标记，绝不默认通过）。
+        """
+        current = list(messages)
+        last_error: str | None = None
+        for attempt in range(2):
+            if last_error is not None:
+                current = [
+                    *messages,
+                    {
+                        "role": "assistant",
+                        "content": "(上一次输出不合规范，已被系统拒绝)",
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"你的上一份输出未通过校验，错误信息：\n{last_error}\n\n"
+                            "请严格按照原始要求与上述错误提示，重新输出完全合规的 JSON。"
+                        ),
+                    },
+                ]
+            resp = await self._chat(current, state, temperature=temperature)
+            data = self._parse_llm_json(resp.content)
+            if data is None:
+                last_error = "输出不是合法的 JSON 对象"
+                continue
+            try:
+                model = schema.model_validate(data)
+            except ValidationError as exc:
+                last_error = _summarize_validation_error(exc)
+                continue
+            if validator is not None:
+                domain_error = validator(model)
+                if domain_error:
+                    last_error = domain_error
+                    continue
+            return model
+        raise StructuredOutputError(
+            f"结构化输出重试后仍不合规：{last_error}"
+        )
 
     def _get_tool_schemas(self) -> list[dict[str, Any]] | None:
         """返回注册时快照的 JSON Schema；无工具时返回 None 而非空列表。"""

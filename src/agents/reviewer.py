@@ -1,6 +1,7 @@
 from src.budget import BudgetGuard
 from src.llm.base import LLMProvider
 from src.prompts import REVIEWER_SYSTEM_PROMPT
+from src.schemas import ReviewReport, StructuredOutputError
 from src.state import GLOBAL_SCOPE, Stage, WritingState
 
 from .base import BaseAgent
@@ -11,7 +12,8 @@ class ReviewerAgent(BaseAgent):
     审稿人 Agent：
     1. 全局比对原始大纲要求与调研事实，审查技术论据的客观性与深度
     2. 严格核验专业英文术语是否遵循「中文译名（English Name）」规范
-    3. 输出结构化评审报告（得分、通过判定、针对性修改清单）
+    3. 输出结构化评审报告（得分、通过判定、针对性修改清单），
+       经 Pydantic 严格校验 + section 取值域校验，失败带错误重试一次
     """
 
     def __init__(self, llm: LLMProvider, budget: BudgetGuard | None = None):
@@ -22,114 +24,82 @@ class ReviewerAgent(BaseAgent):
     async def run(self, state: WritingState) -> WritingState:
         state.current_stage = Stage.REVIEWING
 
+        # 合法取值显式告知：模型不再需要猜 section 该写什么格式
+        titles = [s.title for s in state.sections]
+        legal_values = [*titles, GLOBAL_SCOPE]
+
         user_content = f"""【文章标题】：{state.outline_title}
 【预期大纲要求】：
-{[s.title for s in state.sections]}
+{titles}
 
 【待评审草稿全文】：
 {state.full_draft}
 
-请依据审查标准，严格评估并输出符合规范的 JSON 评审报告："""
+请依据审查标准，严格评估并输出符合规范的 JSON 评审报告。
+actionable_revisions 中每条 section 字段只允许取以下值之一（逐字复制，禁止使用正文子标题）：
+{legal_values}"""
 
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": user_content},
         ]
 
-        resp = await self._chat_with_tools(
-            messages=messages,
-            state=state,
-            temperature=0.2,
-        )
-
-        raw = resp.content.strip()
-        data = self._parse_llm_json(raw)
-        if not isinstance(data, dict):
-            # 两级解析都失败时的保底判定：默认通过并定稿，保证写作流程能收敛
-            data = {
-                "passed": True,
-                "score": 85.0,
-                "critiques": ["无法解析审稿人详细 JSON，默认通过并定稿。"],
-                "actionable_revisions": [],
-            }
-
         try:
-            state.review_score = float(data.get("score", 85.0))
-        except (TypeError, ValueError):
-            # score 偶发为非数值（如 "八十八"）：回退默认分，不让畸形字段打断审稿
-            state.review_score = 85.0
-        state.review_passed = self._coerce_bool(
-            data.get("passed"), default=state.review_score >= 85.0
-        )
-        state.critiques = data.get("critiques", [])
-        raw_revisions = data.get("actionable_revisions", [])
-        if not isinstance(raw_revisions, list):
-            raw_revisions = []
-        state.actionable_revisions = self._normalize_revisions(
-            raw_revisions, [s.title for s in state.sections]
-        )
+            report = await self._chat_structured(
+                messages,
+                ReviewReport,
+                state,
+                temperature=0.2,
+                validator=self._make_scope_validator(titles),
+            )
+        except StructuredOutputError as exc:
+            # review_degraded（fail-closed）：绝不默认通过。判定为未通过，
+            # 交给修订回路与强制定稿回退兜底；降级事实显式进 errors 与意见列表
+            self.logger.warning("审稿输出降级：%s", exc)
+            state.errors.append(f"review_degraded: {exc}")
+            state.review_passed = False
+            state.critiques = [f"（review_degraded）审稿输出不合规，本轮判定未通过：{exc}"]
+            state.actionable_revisions = []
+            return state
 
+        state.review_score = report.score
+        state.review_passed = report.passed
+        state.critiques = report.critiques
+        state.actionable_revisions = [
+            {"section": rev.section, "advice": rev.advice}
+            for rev in report.actionable_revisions
+        ]
         return state
 
-    @staticmethod
-    def _coerce_bool(value: object, default: bool = False) -> bool:
-        """把模型输出的宽松布尔值规范为真正的 bool。
+    def _make_scope_validator(self, titles: list[str]):
+        """构造取值域校验器：section 必须落在大纲标题或 GLOBAL_SCOPE。
 
-        模型偶发输出 "false"/"0" 等字符串，而 bool("false") 为 True，
-        曾导致低分稿被误判通过（fail-open）。无法识别的值回退 default，
-        由调用方决定缺省语义。
+        能模糊匹配的先归一化为精确标题（保留容错），完全定位不了的
+        返回错误信息——由 _chat_structured 回灌给模型重试修正，
+        而不是像旧逻辑那样静默归入全局（基线 17/17 定位失败的根因）。
         """
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)):
-            return bool(value)
-        if isinstance(value, str):
-            lowered = value.strip().lower()
-            if lowered in ("true", "1", "yes", "on"):
-                return True
-            if lowered in ("false", "0", "no", "off"):
-                return False
-        return default
 
-    def _normalize_revisions(
-        self, raw_revisions: list, section_titles: list[str]
-    ) -> list[dict[str, str]]:
-        """把模型输出的意见统一规范为 {"section": 标题|全局, "advice": 建议}。
-
-        兼容两种输出形态：结构化对象（新规范）与纯字符串（模型偶发的旧格式）。
-        定位不到任何小节标题的意见归入全局，保证意见永远不会被静默丢弃。
-        """
-        titles = [t.strip() for t in section_titles]
-        normalized: list[dict[str, str]] = []
-        for rev in raw_revisions:
-            if isinstance(rev, dict):
-                raw_advice = rev.get("advice", "")
-                raw_scope = rev.get("section", "")
-                advice = raw_advice.strip() if isinstance(raw_advice, str) else ""
-                scope = raw_scope.strip() if isinstance(raw_scope, str) else ""
-            elif isinstance(rev, str):
-                advice, scope = rev.strip(), ""
-            else:
-                continue
-            if not advice:
-                continue
-
-            # 显式标记为全局时必须尊重其作用域，不能因为 advice 偶然包含
-            # 某个标题而把它重新归类成局部意见。
-            if scope == GLOBAL_SCOPE:
-                normalized.append({"section": GLOBAL_SCOPE, "advice": advice})
-                continue
-
-            # 优先用声明的 section 定位；定位失败再尝试从建议文本中反查标题
-            matched = self._match_title(scope, titles) or self._match_title(
-                advice, titles
-            )
-            if scope and not matched:
-                self.logger.warning(
-                    "审稿意见定位「%s」未能匹配任何小节标题，已归入全局", scope
+        def validate(report: ReviewReport) -> str | None:
+            for i, rev in enumerate(report.actionable_revisions):
+                scope = rev.section.strip()
+                if scope == GLOBAL_SCOPE or scope in titles:
+                    if scope != rev.section:
+                        rev.section = scope
+                    continue
+                matched = self._match_title(scope, titles) or self._match_title(
+                    rev.advice, titles
                 )
-            normalized.append({"section": matched or GLOBAL_SCOPE, "advice": advice})
-        return normalized
+                if matched:
+                    rev.section = matched
+                    continue
+                return (
+                    f"actionable_revisions[{i}].section 的值「{rev.section}」"
+                    f"不在合法取值内，必须逐字复制 {titles} 之一，"
+                    f"或不针对具体小节时填 \"{GLOBAL_SCOPE}\""
+                )
+            return None
+
+        return validate
 
     @staticmethod
     def _match_title(text: str, titles: list[str]) -> str:
