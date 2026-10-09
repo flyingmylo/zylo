@@ -1,6 +1,6 @@
 import asyncio
 import sys
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import typer
 from rich import box
@@ -14,6 +14,9 @@ from src.llm.openai_provider import OpenAICompatibleProvider
 from src.orchestrator import WritingOrchestrator
 from src.runs import RunStatus
 from src.state import WritingState, serialize_state
+
+if TYPE_CHECKING:
+    from src.llm.mock import MockLLMProvider
 
 console = Console()
 app = typer.Typer(
@@ -299,20 +302,28 @@ def serve(
     # 嵌入模型权重 2GB：真实模式下进程内只加载一次，跨 run 复用
     shared: dict[str, EmbeddingProvider] = {}
 
+    # Mock 的审稿轮次状态在 provider 实例内：按 run 缓存实例，
+    # 人审决策恢复重建 executor 时轮次得以延续（第二轮才会判通过）
+    mock_llms: dict[str, MockLLMProvider] = {}
+
     def make_executor(run) -> WritingOrchestrator:
         from src.budget import BudgetGuard
+
+        # 请求体 human_review=True 的 run 开启人审停点（每轮审稿后暂停等决策）
+        human_review = bool(run.config.get("human_review"))
 
         if mock:
             from src.embeddings.dummy import DummyEmbeddingProvider
             from src.llm.mock import MockLLMProvider
 
-            # 每次运行一个新 Mock 实例：审稿轮次状态按 run 隔离
+            llm = mock_llms.setdefault(run.id, MockLLMProvider())
             return WritingOrchestrator(
-                llm=MockLLMProvider(),
+                llm=llm,
                 embedding_provider=DummyEmbeddingProvider(),
                 kb_persist_dir=f"data/chroma/{run.id}",
                 budget=BudgetGuard.from_env(),
                 trace=TraceEmitter(bus, run.id),
+                human_review=human_review,
             )
 
         if not config.api_key or not config.model:
@@ -337,6 +348,7 @@ def serve(
             kb_persist_dir=f"data/chroma/{run.id}",
             budget=BudgetGuard.from_env(),
             trace=TraceEmitter(bus, run.id),
+            human_review=human_review,
         )
 
     # SQLite 事实来源：重启后运行列表、详情与事件历史仍可查询。
