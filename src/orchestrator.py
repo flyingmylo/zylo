@@ -29,12 +29,15 @@ class WritingOrchestrator:
         reranker_provider: RerankerProvider | None = None,
         tavily_api_key: str | None = None,
         progress_callback: Callable[[str, WritingState], None] | None = None,
+        kb_persist_dir: str | None = None,
     ):
         self.llm = llm
         self.embedding = embedding_provider
         self.reranker = reranker_provider
         self.tavily_api_key = tavily_api_key
         self.on_progress = progress_callback or (lambda msg, state: None)
+        # None = 进程内内存库；指定目录则向量落盘且 resume 可恢复检索
+        self.kb_persist_dir = kb_persist_dir
 
     async def execute(
         self,
@@ -63,11 +66,17 @@ class WritingOrchestrator:
             extra_instructions=extra_instructions,
         )
 
-        # 1. 初始化专属文章级别的 KnowledgeBase
+        # 1. 初始化专属文章级别的 KnowledgeBase。
+        # resume 时沿用快照里的 collection 名：配合持久目录可重开原库，
+        # 调研产出的向量检索能力跨进程恢复
         kb = KnowledgeBase(
+            collection_name=state.kb_collection_name or None,
             embedding_provider=self.embedding,
             reranker_provider=self.reranker,
+            persist_dir=self.kb_persist_dir,
         )
+        if not state.kb_collection_name:
+            state.kb_collection_name = kb.collection_name
 
         # 初始化 4 个 Agent
         search_tool = (

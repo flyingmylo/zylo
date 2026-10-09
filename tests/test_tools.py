@@ -121,6 +121,47 @@ def test_knowledge_base_bilingual_retrieve():
     assert len(results) > 0
 
 
+def test_knowledge_base_add_is_idempotent():
+    """稳定 ID + upsert：重复提交相同内容不产生重复向量（重试/恢复安全）。"""
+    kb = KnowledgeBase(collection_name="test_idempotent", embedding_provider=DummyEmbeddingProvider())
+    docs = [
+        {"text": "KV-Cache 显存占用随上下文长度线性增长。", "source": "kv.md", "page": "1"},
+        {"text": "PagedAttention 消除内存碎片。", "source": "kv.md", "page": "2"},
+    ]
+
+    kb.add_documents(docs)
+    kb.add_documents(docs)  # 模拟重试重复提交
+
+    assert kb.count() == 2
+
+
+def test_knowledge_base_persists_across_instances(tmp_path):
+    """PersistentClient：新实例同目录同名 collection，向量幸存可检索。"""
+    persist_dir = str(tmp_path / "chroma" / "run_x")
+    docs = [
+        {"text": "大语言模型的记忆机制包括短期工作记忆。", "source": "zh.md", "page": "1"},
+    ]
+
+    first = KnowledgeBase(
+        collection_name="writing_persist",
+        embedding_provider=DummyEmbeddingProvider(),
+        persist_dir=persist_dir,
+    )
+    first.add_documents(docs)
+    assert first.count() == 1
+
+    # 模拟进程重启：全新实例重开同一目录
+    reopened = KnowledgeBase(
+        collection_name="writing_persist",
+        embedding_provider=DummyEmbeddingProvider(),
+        persist_dir=persist_dir,
+    )
+    assert reopened.count() == 1
+    results = reopened.retrieve(query_zh="记忆机制", top_k=1)
+    assert len(results) == 1
+    assert results[0]["source"] == "zh.md"
+
+
 def test_document_reader_pdf(tmp_path):
     pdf_path = tmp_path / "sample_paper.pdf"
 

@@ -32,7 +32,7 @@ class StubExecutor:
 def _make_client(state: WritingState | None = None):
     bus = TraceBus()
     runner = JobRunner(bus)
-    app = create_app(bus=bus, runner=runner, executor_factory=lambda: StubExecutor(state))
+    app = create_app(bus=bus, runner=runner, executor_factory=lambda run: StubExecutor(state))
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://test"), runner
 
 
@@ -100,7 +100,7 @@ async def test_article_rejects_incomplete_run():
             await release.wait()
             return await super().execute(*args, **kwargs)
 
-    app = create_app(bus=bus, runner=runner, executor_factory=SlowExecutor)
+    app = create_app(bus=bus, runner=runner, executor_factory=lambda run: SlowExecutor())
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         created = (await client.post("/api/runs", json={"topic": "慢任务"})).json()
         try:
@@ -170,7 +170,7 @@ async def test_runs_survive_service_restart(tmp_path):
 
     bus1 = TraceBus()
     runner1 = JobRunner(bus1, store=RunStore(db_path))
-    app1 = create_app(bus=bus1, runner=runner1, executor_factory=StubExecutor)
+    app1 = create_app(bus=bus1, runner=runner1, executor_factory=lambda run: StubExecutor())
     async with AsyncClient(transport=ASGITransport(app=app1), base_url="http://t1") as c1:
         created = (await c1.post("/api/runs", json={"topic": "重启幸存者"})).json()
         await runner1.wait(created["id"])
@@ -179,7 +179,7 @@ async def test_runs_survive_service_restart(tmp_path):
     # 全新进程的内存状态：只有同一个 SQLite 文件
     bus2 = TraceBus()
     runner2 = JobRunner(bus2, store=RunStore(db_path))
-    app2 = create_app(bus=bus2, runner=runner2, executor_factory=StubExecutor)
+    app2 = create_app(bus=bus2, runner=runner2, executor_factory=lambda run: StubExecutor())
     async with AsyncClient(transport=ASGITransport(app=app2), base_url="http://t2") as c2:
         listing = (await c2.get("/api/runs")).json()
         assert [item["id"] for item in listing["items"]] == [created["id"]]

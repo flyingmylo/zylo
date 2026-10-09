@@ -296,7 +296,7 @@ def serve(
     # 嵌入模型权重 2GB：真实模式下进程内只加载一次，跨 run 复用
     shared: dict[str, EmbeddingProvider] = {}
 
-    def make_executor() -> WritingOrchestrator:
+    def make_executor(run) -> WritingOrchestrator:
         if mock:
             from src.embeddings.dummy import DummyEmbeddingProvider
             from src.llm.mock import MockLLMProvider
@@ -305,6 +305,7 @@ def serve(
             return WritingOrchestrator(
                 llm=MockLLMProvider(),
                 embedding_provider=DummyEmbeddingProvider(),
+                kb_persist_dir=f"data/chroma/{run.id}",
             )
 
         if not config.api_key or not config.model:
@@ -326,6 +327,7 @@ def serve(
             ),
             embedding_provider=shared["embedding"],
             tavily_api_key=config.tavily_api_key or None,
+            kb_persist_dir=f"data/chroma/{run.id}",
         )
 
     # SQLite 事实来源：重启后运行列表、详情与事件历史仍可查询
@@ -422,6 +424,7 @@ def resume_cmd(
             embedding_provider=embedding,
             tavily_api_key=config.tavily_api_key or None,
             progress_callback=progress,
+            kb_persist_dir=f"data/chroma/{run.id}",
         ).execute(
             topic=run.topic,
             output_dir=output_dir,

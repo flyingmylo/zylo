@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from api.bus import TraceBus
 from api.runner import JobRunner, RunExecutor, RunNotFoundError
 from api.schema import ArticleResponse, RunCreateRequest
-from src.runs import RunStatus
+from src.runs import Run, RunStatus
 
 API_PREFIX = "/api"
 
@@ -20,9 +20,13 @@ API_PREFIX = "/api"
 def create_app(
     bus: TraceBus,
     runner: JobRunner,
-    executor_factory: Callable[[], RunExecutor],
+    executor_factory: Callable[[Run], RunExecutor],
 ) -> FastAPI:
-    """装配应用；bus/runner/executor_factory 挂到 app.state 供路由访问。"""
+    """装配应用；bus/runner/executor_factory 挂到 app.state 供路由访问。
+
+    executor_factory 以 Run 为参数：执行体可按 run 决定持久化目录
+    （如 data/chroma/{run.id}），实现按 run 隔离的知识库。
+    """
     app = FastAPI(title="zylo", version="0.1.0")
     app.state.bus = bus
     app.state.runner = runner
@@ -41,7 +45,7 @@ def create_app(
         run = runner_.create(
             topic=body.topic, sources=body.sources, instructions=body.instructions
         )
-        runner_.launch(run.id, request.app.state.executor_factory())
+        runner_.launch(run.id, request.app.state.executor_factory(run))
         return run.model_dump(mode="json")
 
     @app.get(f"{API_PREFIX}/runs")

@@ -1,3 +1,4 @@
+import hashlib
 import uuid
 from collections.abc import Sequence
 from typing import cast
@@ -52,6 +53,10 @@ class KnowledgeBase:
     - 隔离每次写作任务的 Collection 生命周期
     - 封装中英双语扩展检索
     - 预留 Reranker 重排钩子
+
+    persist_dir 为空时是进程内内存库（CLI 一次性任务/单元测试）；
+    指定目录时切换 PersistentClient：向量随目录落盘，resume 时以
+    相同目录 + collection 名重开即可恢复检索，调研不重复执行。
     """
 
     def __init__(
@@ -59,9 +64,14 @@ class KnowledgeBase:
         collection_name: str | None = None,
         embedding_provider: EmbeddingProvider | None = None,
         reranker_provider: RerankerProvider | None = None,
+        persist_dir: str | None = None,
     ):
         self.collection_name: str = collection_name or f"writing_{uuid.uuid4().hex[:8]}"
-        self.client: ClientAPI = chromadb.Client()
+        self.client: ClientAPI = (
+            chromadb.PersistentClient(path=persist_dir)
+            if persist_dir
+            else chromadb.Client()
+        )
         self.embedding_provider: EmbeddingProvider | None = embedding_provider
         self.reranker: RerankerProvider | None = reranker_provider
 
@@ -79,9 +89,21 @@ class KnowledgeBase:
             metadata={"hnsw:space": "cosine"},
         )
 
+    @staticmethod
+    def _stable_chunk_id(doc: dict[str, str]) -> str:
+        """内容哈希 ID：同文本+来源+页码永远同 ID，配合 upsert 实现幂等入库。
+
+        重试与 resume 场景下重复 add 相同内容不会产生重复向量（随机 ID 时代的
+        老问题），按 run 审计时 ID 也可反查内容。
+        """
+        digest = hashlib.sha256(
+            f"{doc.get('text', '')}|{doc.get('source', '')}|{doc.get('page', '1')}".encode()
+        ).hexdigest()
+        return digest[:16]
+
     def add_documents(self, documents: list[dict[str, str]]):
         """
-        批量入库文档块
+        批量入库文档块（幂等：稳定 ID + upsert，重复提交自动去重）
         documents: [{"text": "...", "source": "...", "page": "1"}, ...]
         """
         if not documents:
@@ -92,14 +114,11 @@ class KnowledgeBase:
             {"source": d.get("source", "unknown"), "page": str(d.get("page", "1"))}
             for d in documents
         ]
-        ids = [
-            f"{self.collection_name}_{i}_{uuid.uuid4().hex[:6]}"
-            for i in range(len(documents))
-        ]
+        ids = [self._stable_chunk_id(d) for d in documents]
 
         batch_size = 64
         for i in range(0, len(texts), batch_size):
-            self.collection.add(
+            self.collection.upsert(
                 documents=texts[i : i + batch_size],
                 metadatas=metadatas[i : i + batch_size],
                 ids=ids[i : i + batch_size],
