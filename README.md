@@ -11,6 +11,7 @@
 - **双语 Query 扩展 + 相对 Top-K**：破除跨语言检索相似度打折陷阱，使用同语言精确对齐，保留英文原著高价值论据。
 - **专业术语双语对照规范**：英文文献概念首次出现强制标注文档：`中文译名（English Name）`，如 *倒数排名融合（Reciprocal Rank Fusion, RRF）*。
 - **反思自愈审稿回路**：集成严苛的 Reviewer Agent，针对事实性、逻辑性与术语规范度多维度打分，最多 2 轮定向反思重写。
+- **长任务可靠性**：SQLite 状态持久化、断点续跑不重复扣费、LLM 预算三层熔断、SSE 实时 Trace 与人在回路审稿（FastAPI + React 工作台）。
 - **BYOK 与模型无关**：支持 OpenAI, DeepSeek, 通义千问, 智谱 GLM 以及本地 Ollama 等所有 OpenAI 标准接口。
 
 ---
@@ -49,4 +50,29 @@ zylo config
 > **💡 智能 Reranker 激活机制**：默认策略为 `ENABLE_RERANK=auto`。当检测到输入了本地文档或网页/论文 URL 时，系统会自动激活本地 `bge-reranker-v2-m3` 深度精排；纯纯网络检索时默认保持轻量极速。
 
 生成的 Markdown 文件将自动归档至 `output/` 目录。
+
+### 3. API 服务 + Web 工作台
+
+终端一：启动 API 服务：
+
+```bash
+zylo serve            # 真实模式，读取 .env 中的 LLM 配置
+zylo serve --mock     # 离线演示模式：Mock LLM + 固定嵌入，无需 API Key、本地模型与网络
+```
+
+终端二：启动前端开发服务器（Vite 已配置将 `/api` 代理到 8000 端口）：
+
+```bash
+cd web && npm install && npm run dev    # 浏览器打开 http://localhost:5173
+```
+
+在 Web 工作台中可创建写作任务、实时查看 Researcher / Planner / Writer / Reviewer 的事件时间线（SSE），并获取最终成稿。
+
+### 4. 断点续跑
+
+任务中断（进程退出、预算暂停）后，从最新阶段快照继续执行，已完成阶段不重复扣费：
+
+```bash
+zylo resume <run_id>   # run_id 可在运行列表或 output/ 目录名中查看
+```
 
