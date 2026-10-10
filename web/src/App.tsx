@@ -13,10 +13,10 @@ export default function App() {
   const [view, setView] = useState<View>({ name: "form" });
 
   return (
-    <main>
-      <header className="app-header">
-        <h1>zylo 工作台</h1>
-        <p>多智能体深度技术写作 · 运行可观测</p>
+    <main className="mx-auto max-w-215 px-5 pt-8 pb-20">
+      <header className="mb-7">
+        <h1 className="text-2xl font-bold">zylo 工作台</h1>
+        <p className="mt-1 text-sm text-muted-foreground">多智能体深度技术写作 · 运行可观测</p>
       </header>
 
       {view.name === "form" && (

@@ -1,116 +1,157 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+/*
+ * 主题遵循 shadcn/ui 官方 neutral 色板（oklch 双主题结构）：
+ * :root 为亮色基线，.dark 为暗色覆盖；html 标签挂 class="dark"
+ * 强制暗色运行时（工作台为纯暗色产品，不提供切换入口）。
+ * success/warning 为项目扩展——shadcn 语义里没有这两种状态色，
+ * 运行时间线/审稿面板需要，取值对齐官方调色板（emerald/amber 系）。
+ */
+@custom-variant dark (&:is(.dark *));
+
 :root {
-  color-scheme: dark;
-  --bg: #12141a;
-  --card: #1b1f29;
-  --border: #2c3242;
-  --text: #e4e8f1;
-  --muted: #8b93a7;
-  --accent: #4cc2ff;
-  --ok: #3fd68f;
-  --warn: #ffc457;
-  --err: #ff6b7a;
-  font-family: "PingFang SC", "Hiragino Sans GB", system-ui, sans-serif;
+  --radius: 0.625rem;
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  /* 品牌蓝：亮色底用深一档（#0284c7 系），白底对比度足够 */
+  --primary: oklch(0.588 0.139 242.0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --destructive-foreground: oklch(0.985 0 0);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+  --chart-1: oklch(0.646 0.222 41.116);
+  --chart-2: oklch(0.6 0.118 184.704);
+  --chart-3: oklch(0.398 0.07 227.392);
+  --chart-4: oklch(0.828 0.189 84.429);
+  --chart-5: oklch(0.769 0.188 70.08);
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-primary: oklch(0.205 0 0);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.97 0 0);
+  --sidebar-accent-foreground: oklch(0.205 0 0);
+  --sidebar-border: oklch(0.922 0 0);
+  --sidebar-ring: oklch(0.708 0 0);
+  --success: oklch(0.627 0.194 149.214);
+  --warning: oklch(0.769 0.188 70.08);
 }
 
-* { box-sizing: border-box; }
-
-body {
-  margin: 0;
-  background: var(--bg);
-  color: var(--text);
-  line-height: 1.6;
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  /* 品牌蓝 #4cc2ff 的 oklch 值，覆盖官方中性 primary；蓝底配深色文字对比最佳 */
+  --primary: oklch(0.773 0.136 235.1);
+  --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --destructive-foreground: oklch(0.985 0 0);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.556 0 0);
+  --chart-1: oklch(0.488 0.243 264.376);
+  --chart-2: oklch(0.696 0.17 162.48);
+  --chart-3: oklch(0.769 0.188 70.08);
+  --chart-4: oklch(0.627 0.265 303.9);
+  --chart-5: oklch(0.545 0.246 262.881);
+  --sidebar: oklch(0.205 0 0);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.488 0.243 264.376);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.269 0 0);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.556 0 0);
+  --success: oklch(0.696 0.17 162.48);
+  --warning: oklch(0.828 0.189 84.429);
 }
 
-main {
-  max-width: 860px;
-  margin: 0 auto;
-  padding: 32px 20px 80px;
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
 }
 
-.app-header { margin-bottom: 28px; }
-.app-header h1 { margin: 0; font-size: 26px; }
-.app-header p { margin: 4px 0 0; color: var(--muted); font-size: 14px; }
-
-.card {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 24px;
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+    margin: 0;
+    line-height: 1.6;
+    font-family: "PingFang SC", "Hiragino Sans GB", system-ui, sans-serif;
+  }
 }
 
-.card h2 { margin: 0 0 16px; font-size: 19px; }
-
-label { display: block; margin-bottom: 14px; font-size: 14px; color: var(--muted); }
-.required { color: var(--err); }
-
-input, textarea {
-  width: 100%;
-  margin-top: 6px;
-  padding: 10px 12px;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  color: var(--text);
+/*
+ * 文章排版（ReactMarkdown 渲染产物）保留全局 CSS：
+ * 生成内容无法逐元素挂 Tailwind 类，全局选择器最省事。
+ */
+.markdown {
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
   font-size: 14px;
 }
-input:focus, textarea:focus { outline: 1px solid var(--accent); }
-
-button {
-  padding: 10px 22px;
-  background: var(--accent);
-  color: #08212f;
-  font-weight: 600;
-  font-size: 14px;
-  border: none;
-  border-radius: 8px;
-  cursor: pointer;
-}
-button:disabled { opacity: 0.5; cursor: not-allowed; }
-
-.error { color: var(--err); font-size: 13px; }
-
-.timeline-header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-.timeline-header h2 { margin: 0; }
-
-.badge {
-  padding: 2px 12px;
-  border-radius: 999px;
-  font-size: 12px;
-  background: var(--border);
-  color: var(--muted);
-}
-.badge-running, .badge-revising { background: rgba(76, 194, 255, 0.15); color: var(--accent); }
-.badge-completed { background: rgba(63, 214, 143, 0.15); color: var(--ok); }
-.badge-failed, .badge-cancelled { background: rgba(255, 107, 122, 0.15); color: var(--err); }
-
-.timeline { list-style: none; margin: 16px 0; padding: 0; }
-.event {
-  display: flex;
-  gap: 12px;
-  align-items: baseline;
-  padding: 8px 12px;
-  border-left: 2px solid var(--border);
-  margin-left: 8px;
-  font-size: 13px;
-}
-.event-completed { border-left-color: var(--ok); }
-.event-failed { border-left-color: var(--err); }
-.event-started { border-left-color: var(--accent); }
-.event-seq { color: var(--muted); font-variant-numeric: tabular-nums; }
-.event-name { font-weight: 600; }
-.event-status { color: var(--muted); }
-.event-meta { color: var(--warn); margin-left: auto; }
-.event.muted { color: var(--muted); }
-
-.meta { color: var(--muted); font-size: 13px; margin: 0 0 16px; }
-.meta strong { color: var(--warn); }
-
-.markdown { border-top: 1px solid var(--border); padding-top: 8px; font-size: 14px; }
 .markdown h1, .markdown h2, .markdown h3 { border-bottom: 1px solid var(--border); padding-bottom: 6px; }
-.markdown code { background: var(--bg); padding: 1px 6px; border-radius: 4px; font-size: 13px; }
-.markdown pre { background: var(--bg); padding: 12px; border-radius: 8px; overflow-x: auto; }
-.markdown blockquote { color: var(--muted); border-left: 3px solid var(--border); margin-left: 0; padding-left: 14px; }
+.markdown code { background: var(--background); padding: 1px 6px; border-radius: 4px; font-size: 13px; }
+.markdown pre { background: var(--background); padding: 12px; border-radius: 8px; overflow-x: auto; }
+.markdown blockquote { color: var(--muted-foreground); border-left: 3px solid var(--border); margin-left: 0; padding-left: 14px; }
 .markdown table { border-collapse: collapse; }
 .markdown th, .markdown td { border: 1px solid var(--border); padding: 6px 10px; }
-
-.actions { margin-top: 18px; display: flex; gap: 12px; }
